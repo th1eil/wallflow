@@ -1,0 +1,82 @@
+[package]
+name = "wallflow"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84.0"
+
+[dependencies]
+# Tokio async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# macOS Native bindings (objc2)
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = [
+    "NSObject",
+    "NSString",
+    "NSURL",
+    "NSDictionary",
+    "NSArray",
+    "NSError",
+    "NSThread",
+    "NSGeometry",
+    "NSNotification",
+    "NSTimer",
+    "NSBundle",
+    "NSData"
+] }
+objc2-app-kit = { version = "0.3.2", features = [
+    "NSApplication",
+    "NSWorkspace",
+    "NSStatusItem",
+    "NSStatusBar",
+    "NSMenu",
+    "NSMenuItem",
+    "NSScreen",
+    "NSImage",
+    "NSButton",
+    "NSResponder",
+    "NSEvent",
+    "NSWindow",
+    "NSView",
+    "NSControl",
+    "NSTextField",
+    "NSSlider",
+    "NSPopUpButton"
+] }
+objc2-av-foundation = { version = "0.3.2" }
+# CoreVideo and CoreMedia
+objc2-core-video = { version = "0.3.2" }
+objc2-core-media = { version = "0.3.2" }
+
+# Graphics pipeline (wgpu)
+wgpu = "23.0"
+bytemuck = { version = "1.15", features = ["derive"] }
+pollster = "0.3"
+
+# Image decoding/encoding (PNG, JPEG, WebP, GIF, APNG)
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+
+# Configuration parsing
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# File system watcher for hot reload
+notify = "6.1"
+
+# Temporary files
+tempfile = "3.10"
+
+# Error handling
+anyhow = "1.0"
+
+# Pin aligned to avoid edition2024 dependencies
+aligned = "=0.4.1"
+
+# Pin transitive dependencies to avoid Rust 1.85+ and edition2024 requirements
+getrandom = "=0.2.15"
+indexmap = "=2.2.6"
+hashbrown = "=0.14.5"
+
+
+
+
