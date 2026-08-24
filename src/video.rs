@@ -141,7 +141,7 @@ fn video_loop(
             if let Some(png_bytes) = grab_frame(&*generator, current_time) {
                 let target_path = if use_a { &path_a } else { &path_b };
                 if std::fs::write(target_path, &png_bytes).is_ok() {
-                    let _ = tx.send(AppEvent::SetWallpaperOnScreen {
+                    let _ = tx.send(AppEvent::SetDynamicFrame {
                         screen_number,
                         path: target_path.clone(),
                     });
@@ -282,7 +282,7 @@ unsafe fn grab_frame(generator: &NSObject, time_secs: f64) -> Option<Vec<u8>> {
     if bitmap.is_null() { return None; }
 
     // NSPNGFileType = 4
-    let png: *mut NSObject = msg_send![&*bitmap, representationUsingType: 4u64, properties: None::<&NSDictionary>];
+    let png: *mut NSObject = msg_send![&*bitmap, representationUsingType: crate::util::NS_PNG_FILE_TYPE, properties: None::<&NSDictionary>];
     if png.is_null() { return None; }
 
     let len: usize = msg_send![&*png, length];

@@ -109,7 +109,7 @@ unsafe fn decode_image_native(path: &Path) -> Result<image::RgbaImage> {
     }
 
     // NSPNGFileType = 4
-    let png: *mut NSObject = msg_send![&*bitmap, representationUsingType: 4u64, properties: None::<&NSDictionary>];
+    let png: *mut NSObject = msg_send![&*bitmap, representationUsingType: crate::util::NS_PNG_FILE_TYPE, properties: None::<&NSDictionary>];
     if png.is_null() {
         return Err(anyhow!("PNG representation failed"));
     }
@@ -191,18 +191,18 @@ pub fn set_wallpaper_with_fade(mtm: MainThreadMarker, screen: &NSScreen, path: &
     }
 }
 
+static DOWNLOAD_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Download a random wallpaper from picsum.photos (free, no API key required).
 /// Saves to the given directory and returns the file path.
-/// Uses `curl` which is pre-installed on macOS.
-///
-/// 修复：添加 `-f` 使 curl 在 HTTP 错误时返回非零退出码；
-/// 下载后校验文件是否为有效图片；失败时清理残留文件。
+/// Uses `curl` with failure status code checking and file validation.
 pub fn download_random_wallpaper(dir: &Path, url: &str) -> Result<PathBuf> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    let filename = format!("wallflow_random_{}.jpg", ts);
+        .as_millis();
+    let seq = DOWNLOAD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let filename = format!("wallflow_random_{}_{}_{}.jpg", std::process::id(), ts, seq);
     let output = dir.join(&filename);
 
     let status = std::process::Command::new("curl")
