@@ -13,7 +13,8 @@ mod app_event;
 mod util;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use util::TempFileGuard;
 use objc2::{define_class, msg_send, ClassType, MainThreadOnly, sel, DefinedClass};
@@ -22,7 +23,7 @@ use objc2::runtime::NSObject;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSString};
 use library::WallpaperLibrary;
-use app_event::AppEvent;
+use app_event::{AppEvent, WallpaperInfo};
 use menubar::MenuBarManager;
 
 pub struct AppState {
@@ -141,11 +142,26 @@ impl AppState {
                 self.apply_wallpaper_on_screen(sn, &path);
             }
             AppEvent::SetWallpaperOnScreen { screen_number, path } => {
-                // Direct set — used by dynamic players for per-screen frame updates
                 if let Some(target_screen) = screen::find_screen_by_number(self.mtm, screen_number) {
                     if let Err(e) = wallpaper::set_wallpaper(self.mtm, &target_screen, &path) {
                         eprintln!("Error setting wallpaper on screen {}: {:?}", screen_number, e);
                     }
+                }
+            }
+            AppEvent::SetDynamicFrame { screen_number, path } => {
+                // Direct frame update from dynamic/video player
+                if let Some(target_screen) = screen::find_screen_by_number(self.mtm, screen_number) {
+                    if let Err(e) = wallpaper::set_wallpaper(self.mtm, &target_screen, &path) {
+                        eprintln!("Error setting wallpaper frame on screen {}: {:?}", screen_number, e);
+                    }
+                }
+                // Update menu thumbnail
+                if let Some(ref manager) = self.menu_manager {
+                    let filename = path.file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or("Wallpaper");
+                    let info = WallpaperInfo::from_path(&path);
+                    manager.update_thumbnail(filename, Some(&path), Some(&info));
                 }
             }
             AppEvent::TogglePause => {
@@ -173,11 +189,7 @@ impl AppState {
                 println!("Applying reloaded configuration: {:?}", new_config);
 
                 // 1. Update mode
-                let mode = match new_config.mode.as_str() {
-                    "random" => library::SwitchMode::Random,
-                    _ => library::SwitchMode::Sequential,
-                };
-                self.library.set_mode(mode);
+                self.library.set_mode(new_config.mode);
 
                 // 2.5 Update random wallpaper URL
                 self.random_wallpaper_url = new_config.random_wallpaper_url.clone();
@@ -235,15 +247,15 @@ impl AppState {
                     let panel_class = objc2::runtime::AnyClass::get(name);
                     if let Some(cls) = panel_class {
                         let panel: Retained<NSObject> = msg_send![cls, openPanel];
-                        let _: () = msg_send![&panel, setCanChooseDirectories: true];
-                        let _: () = msg_send![&panel, setCanChooseFiles: false];
-                        let _: () = msg_send![&panel, setAllowsMultipleSelection: false];
+                        let _: () = msg_send![&*panel, setCanChooseDirectories: true];
+                        let _: () = msg_send![&*panel, setCanChooseFiles: false];
+                        let _: () = msg_send![&*panel, setAllowsMultipleSelection: false];
 
-                        let response: isize = msg_send![&panel, runModal];
+                        let response: isize = msg_send![&*panel, runModal];
                         if response == 1 {
-                            let url: Option<Retained<NSObject>> = msg_send![&panel, URL];
+                            let url: Option<Retained<NSObject>> = msg_send![&*panel, URL];
                             if let Some(u) = url {
-                                let path_ns: Retained<NSString> = msg_send![&u, path];
+                                let path_ns: Retained<NSString> = msg_send![&*u, path];
                                 let new_path = path_ns.to_string();
                                 println!("User selected wallpaper directory: {}", new_path);
 
@@ -275,17 +287,22 @@ impl AppState {
                     let dl_dir = dir.clone();
                     let url = self.random_wallpaper_url.clone();
                     tokio::spawn(async move {
-                        match wallpaper::download_random_wallpaper(&dl_dir, &url) {
-                            Ok(path) => {
-                                println!("Downloaded: {:?}", path);
-                                // Full rescan to pick up the new file
-                                let wallpapers = library::collect_wallpapers(&dl_dir);
+                        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(PathBuf, Vec<PathBuf>)> {
+                            let path = wallpaper::download_random_wallpaper(&dl_dir, &url)?;
+                            println!("Downloaded: {:?}", path);
+                            let wallpapers = library::collect_wallpapers(&dl_dir);
+                            Ok((dl_dir, wallpapers))
+                        }).await;
+
+                        match res {
+                            Ok(Ok((dir_path, wallpapers))) => {
                                 let _ = tx.send(AppEvent::DirectoryScanned {
-                                    dir_path: dl_dir,
+                                    dir_path,
                                     wallpapers,
                                 });
                             }
-                            Err(e) => eprintln!("Failed to download wallpaper: {:?}", e),
+                            Ok(Err(e)) => eprintln!("Failed to download wallpaper: {:?}", e),
+                            Err(e) => eprintln!("Download wallpaper task joined with error: {:?}", e),
                         }
                     });
                 }
@@ -337,29 +354,6 @@ impl AppState {
 
     /// Apply a wallpaper to a specific screen, identified by its NSScreenNumber.
     fn apply_wallpaper_on_screen(&mut self, screen_number: u32, path: &std::path::Path) {
-        let is_temp_frame = path.file_name()
-            .and_then(|f| f.to_str())
-            .map(|s| s.starts_with("wallflow_frame_"))
-            .unwrap_or(false);
-
-        if is_temp_frame {
-            // Temp frame from dynamic player — set directly on the target screen
-            if let Some(target_screen) = screen::find_screen_by_number(self.mtm, screen_number) {
-                if let Err(e) = wallpaper::set_wallpaper(self.mtm, &target_screen, path) {
-                    eprintln!("Error setting wallpaper: {:?}", e);
-                }
-            }
-            // Update menu thumbnail
-            if let Some(ref manager) = self.menu_manager {
-                let filename = path.file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or("Wallpaper");
-                let info = WallpaperInfo::from_path(path);
-                manager.update_thumbnail(filename, Some(path), Some(&info));
-            }
-            return;
-        }
-
         // Stop any active player on this screen before switching
         if let Some(screen_state) = self.screens.get_mut(&screen_number) {
             screen_state.dynamic_player.stop();
@@ -419,13 +413,39 @@ impl AppState {
             return;
         }
 
-        // Static wallpaper: process with GPU filter for the target screen
-        self.loading_sequence += 1;
-        let sequence_id = self.loading_sequence;
-        let original_path = path.to_path_buf();
         let filters = self.screens.get(&screen_number)
             .map(|s| s.current_filters)
             .unwrap_or_default();
+
+        // Optimization: if no filters are applied, set the wallpaper directly without GPU/CPU pipeline and temp files
+        if filters.is_default() {
+            println!("Setting raw wallpaper directly on screen {}: {:?}", screen_number, path);
+            if let Some(target_screen) = screen::find_screen_by_number(self.mtm, screen_number) {
+                if let Err(e) = wallpaper::set_wallpaper_with_fade(self.mtm, &target_screen, path) {
+                    eprintln!("Error setting wallpaper: {:?}", e);
+                }
+            }
+
+            if let Some(screen_state) = self.screens.get_mut(&screen_number) {
+                if let Some(old_path) = screen_state.last_static_path.take() {
+                    let _ = std::fs::remove_file(old_path);
+                }
+            }
+
+            if let Some(ref manager) = self.menu_manager {
+                let filename = path.file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("Wallpaper");
+                let info = WallpaperInfo::from_path(path);
+                manager.update_thumbnail(filename, Some(path), Some(&info));
+            }
+            return;
+        }
+
+        // Static wallpaper with filters: process with GPU/CPU filter for the target screen
+        self.loading_sequence += 1;
+        let sequence_id = self.loading_sequence;
+        let original_path = path.to_path_buf();
         let filter_pipeline = self.filter_pipeline.clone();
         let event_tx = self.event_tx.clone();
 
@@ -499,8 +519,8 @@ impl Drop for AppState {
 }
 
 pub struct TimerTargetIvars {
-    state: std::sync::Mutex<Option<Arc<Mutex<AppState>>>>,
-    event_rx: std::sync::Mutex<Option<Receiver<AppEvent>>>,
+    state: OnceLock<Arc<Mutex<AppState>>>,
+    event_rx: Mutex<Option<Receiver<AppEvent>>>,
 }
 
 define_class!(
@@ -513,8 +533,8 @@ define_class!(
         #[unsafe(method_id(init))]
         fn init(this: Allocated<Self>) -> Retained<Self> {
             let this = this.set_ivars(TimerTargetIvars {
-                state: std::sync::Mutex::new(None),
-                event_rx: std::sync::Mutex::new(None),
+                state: OnceLock::new(),
+                event_rx: Mutex::new(None),
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -522,8 +542,7 @@ define_class!(
         #[unsafe(method(timerTick:))]
         unsafe fn timer_tick(&self, _timer: *mut NSObject) {
             let rx_lock = self.ivars().event_rx.lock().unwrap();
-            let state_lock = self.ivars().state.lock().unwrap();
-            if let (Some(ref rx), Some(ref state_arc)) = (&*rx_lock, &*state_lock) {
+            if let (Some(ref rx), Some(state_arc)) = (&*rx_lock, self.ivars().state.get()) {
                 while let Ok(event) = rx.try_recv() {
                     if let Ok(mut state) = state_arc.lock() {
                         state.handle_event(event);
@@ -538,7 +557,7 @@ define_class!(
 
 impl TimerTarget {
     pub fn set_state_and_rx(&self, state: Arc<Mutex<AppState>>, event_rx: Receiver<AppEvent>) {
-        *self.ivars().state.lock().unwrap() = Some(state);
+        let _ = self.ivars().state.set(state);
         *self.ivars().event_rx.lock().unwrap() = Some(event_rx);
     }
 }
@@ -579,11 +598,7 @@ fn main() {
         locked_state.menu_manager = Some(menu_manager);
 
         // Apply config options
-        let mode = match initial_config.mode.as_str() {
-            "random" => library::SwitchMode::Random,
-            _ => library::SwitchMode::Sequential,
-        };
-        locked_state.library.set_mode(mode);
+        locked_state.library.set_mode(initial_config.mode);
 
         let init_filters = color::FilterParams {
             brightness: initial_config.filters.brightness * 100.0,
@@ -649,5 +664,3 @@ fn main() {
     println!("WallFlow starting event loop...");
     app.run();
 }
-use app_event::WallpaperInfo;
-use std::path::PathBuf;
