@@ -1,13 +1,23 @@
 use anyhow::Result;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FilterParams {
     pub brightness: f32,  // -100.0 to 100.0, mapped to -1.0 to 1.0
     pub contrast: f32,    // -100.0 to 100.0, mapped to -1.0 to 1.0
     pub saturation: f32,  // -100.0 to 100.0, mapped to -1.0 to 1.0
     pub temperature: f32, // -100.0 to 100.0, mapped to -1.0 to 1.0
     pub blur: f32,        // 0.0 to 20.0 (blur radius)
+}
+
+impl FilterParams {
+    pub fn is_default(&self) -> bool {
+        self.brightness == 0.0
+            && self.contrast == 0.0
+            && self.saturation == 0.0
+            && self.temperature == 0.0
+            && self.blur == 0.0
+    }
 }
 
 /// Unified uniform struct matching the WGSL `ShaderUniform` layout.
@@ -722,9 +732,9 @@ fn gaussian_blur(img: &image::RgbaImage, radius: usize) -> image::RgbaImage {
         }
     }
 
-    // Vertical pass
-    for x in 0..width {
-        for y in 0..height {
+    // Vertical pass (row-major order for cache friendliness)
+    for y in 0..height {
+        for x in 0..width {
             let mut r_sum = 0.0f32;
             let mut g_sum = 0.0f32;
             let mut b_sum = 0.0f32;
