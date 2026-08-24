@@ -7,13 +7,18 @@ use image::AnimationDecoder;
 
 /// Check if a `.png` file is an animated PNG by scanning for the `acTL` chunk.
 /// The acTL chunk must appear before the first IDAT chunk per the APNG spec.
+/// Reads only the initial portion of the file (up to 4KB) rather than the entire file.
 pub fn is_apng(path: &Path) -> bool {
-    let Ok(data) = std::fs::read(path) else { return false };
-    // PNG signature is 8 bytes; chunks follow: [4-byte len][4-byte type][data][4-byte CRC]
-    if data.len() < 33 { return false; }
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut data = [0u8; 4096];
+    let Ok(bytes_read) = file.read(&mut data) else { return false };
+    if bytes_read < 33 { return false; }
+    
+    let slice = &data[..bytes_read];
     let mut pos: usize = 8;
-    while pos + 12 <= data.len() {
-        let chunk_type = &data[pos + 4..pos + 8];
+    while pos + 12 <= slice.len() {
+        let chunk_type = &slice[pos + 4..pos + 8];
         if chunk_type == b"acTL" {
             return true;
         }
@@ -21,7 +26,7 @@ pub fn is_apng(path: &Path) -> bool {
         if chunk_type == b"IDAT" {
             return false;
         }
-        let length = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+        let length = u32::from_be_bytes([slice[pos], slice[pos+1], slice[pos+2], slice[pos+3]]) as usize;
         pos = pos.saturating_add(12 + length); // len(4) + type(4) + data + crc(4)
     }
     false
@@ -184,7 +189,7 @@ impl DynamicWallpaperPlayer {
                 if let Err(e) = img.save(target_path) {
                     eprintln!("Failed to save dynamic frame: {:?}", e);
                 } else {
-                    let _ = tx.send(AppEvent::SetWallpaperOnScreen {
+                    let _ = tx.send(AppEvent::SetDynamicFrame {
                         screen_number,
                         path: target_path.clone(),
                     });

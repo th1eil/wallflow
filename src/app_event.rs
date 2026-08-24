@@ -80,6 +80,11 @@ pub enum AppEvent {
         screen_number: u32,
         path: std::path::PathBuf,
     },
+    /// Direct dynamic frame update (from GIF/APNG/video player) without full reload logic
+    SetDynamicFrame {
+        screen_number: u32,
+        path: std::path::PathBuf,
+    },
     /// Toggle pause/resume for the active screen's dynamic player
     TogglePause,
     /// Change loop mode for the active screen's dynamic player
