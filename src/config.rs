@@ -1,13 +1,17 @@
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use anyhow::Result;
 use notify::{Watcher, RecursiveMode, EventKind};
 use crate::app_event::AppEvent;
+use crate::library::SwitchMode;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub wallpaper_dir: String,
     pub interval_secs: u64,
-    pub mode: String, // "sequential" | "random"
+    #[serde(default)]
+    pub mode: SwitchMode,
     pub filters: FilterConfig,
     /// 随机壁纸下载 URL，调用需返回 image/* Content-Type 的图片直链
     #[serde(default = "default_random_wallpaper_url")]
@@ -35,7 +39,7 @@ impl Default for Config {
         Self {
             wallpaper_dir: pictures.to_string_lossy().to_string(),
             interval_secs: 300,
-            mode: "sequential".to_string(),
+            mode: SwitchMode::Sequential,
             filters: FilterConfig::default(),
             random_wallpaper_url: default_random_wallpaper_url(),
         }
@@ -82,18 +86,22 @@ pub fn watch_config(tx: std::sync::mpsc::Sender<AppEvent>) -> Result<notify::Rec
         .ok_or_else(|| anyhow::anyhow!("Invalid config path"))?
         .to_path_buf();
 
+    let last_reload = Mutex::new(Instant::now() - Duration::from_secs(1));
+
     // Create recommended watcher
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
         match res {
             Ok(event) => {
-                if let EventKind::Modify(_) = event.kind {
+                if let EventKind::Modify(_) | EventKind::Create(_) = event.kind {
                     for path in event.paths {
                         if path.file_name() == Some(std::ffi::OsStr::new("config.toml")) {
-                            println!("Config change detected, reloading...");
-                            // Small sleep to ensure write finishes before reading
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            if let Ok(new_config) = load_or_create_config() {
-                                let _ = tx.send(AppEvent::ConfigReloaded(new_config));
+                            let mut last = last_reload.lock().unwrap();
+                            if last.elapsed() >= Duration::from_millis(200) {
+                                *last = Instant::now();
+                                println!("Config change detected, reloading...");
+                                if let Ok(new_config) = load_or_create_config() {
+                                    let _ = tx.send(AppEvent::ConfigReloaded(new_config));
+                                }
                             }
                         }
                     }

@@ -162,7 +162,11 @@ define_class!(
                 let dir_str = dir_ns.to_string();
 
                 let selected_idx: isize = msg_send![ptrs.mode_popup, indexOfSelectedItem];
-                let mode_str = if selected_idx == 1 { "random" } else { "sequential" };
+                let mode = if selected_idx == 1 {
+                    crate::library::SwitchMode::Random
+                } else {
+                    crate::library::SwitchMode::Sequential
+                };
 
                 let interval_ns: Retained<NSString> = msg_send![ptrs.interval_input, stringValue];
                 let interval_secs: u64 = interval_ns.to_string().parse().unwrap_or(300);
@@ -179,7 +183,7 @@ define_class!(
                 let new_config = config::Config {
                     wallpaper_dir: dir_str,
                     interval_secs,
-                    mode: mode_str.to_string(),
+                    mode,
                     random_wallpaper_url: url_str,
                     filters: config::FilterConfig {
                         brightness: brightness as f32,
@@ -443,7 +447,10 @@ impl SettingsPanel {
                 let url_ns = NSString::from_str(&config.random_wallpaper_url);
                 let _: () = msg_send![ptrs.random_wallpaper_url, setStringValue: &*url_ns];
 
-                let mode_idx: isize = if config.mode == "random" { 1 } else { 0 };
+                let mode_idx: isize = match config.mode {
+                    crate::library::SwitchMode::Random => 1,
+                    _ => 0,
+                };
                 let _: () = msg_send![ptrs.mode_popup, selectItemAtIndex: mode_idx];
 
                 let _: () = msg_send![ptrs.brightness_slider, setDoubleValue: config.filters.brightness as f64];

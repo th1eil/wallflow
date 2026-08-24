@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SwitchMode {
     Sequential,
     Random,
@@ -129,8 +130,23 @@ impl WallpaperLibrary {
                 }
             }
             SwitchMode::Random => {
-                let rand_val = self.rng.next();
-                (rand_val as usize) % self.wallpapers.len()
+                let total = self.wallpapers.len();
+                if total <= 1 {
+                    0
+                } else {
+                    // Try up to 10 times to pick a different wallpaper than current
+                    let mut candidate = (self.rng.next() as usize) % total;
+                    let mut tries = 0;
+                    while Some(candidate) == self.current_index && tries < 10 {
+                        candidate = (self.rng.next() as usize) % total;
+                        tries += 1;
+                    }
+                    if Some(candidate) == self.current_index {
+                        (candidate + 1) % total
+                    } else {
+                        candidate
+                    }
+                }
             }
             SwitchMode::Manual => {
                 return self.current_index.map(|idx| self.wallpapers[idx].clone());
