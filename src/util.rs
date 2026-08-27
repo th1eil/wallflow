@@ -45,6 +45,17 @@ pub fn send_event(tx: &Sender<AppEvent>, event: AppEvent) {
     wake_main_loop();
 }
 
+/// Show a transient message on the menu status line; auto-clears after `secs`.
+/// Safe from any thread.
+pub fn flash_status(tx: &Sender<AppEvent>, text: String, secs: u64) {
+    send_event(tx, AppEvent::SetStatusLine(Some(text)));
+    let tx2 = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        send_event(&tx2, AppEvent::SetStatusLine(None));
+    });
+}
+
 /// Present a modal directory chooser. Must be called on the main thread.
 /// Returns the selected path, or None if cancelled.
 pub fn run_open_directory_panel(

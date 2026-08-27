@@ -10,6 +10,7 @@ mod screen;
 mod playback;
 mod video;
 mod app_event;
+mod notification;
 mod util;
 
 use std::collections::HashMap;
@@ -22,8 +23,9 @@ use objc2::rc::{Allocated, Retained};
 use objc2::runtime::NSObject;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDidChangeScreenParametersNotification,
+    NSWorkspace,
 };
-use objc2_foundation::{MainThreadMarker, NSNotificationCenter, NSObjectProtocol};
+use objc2_foundation::{MainThreadMarker, NSNotificationCenter, NSObjectProtocol, NSURL, NSString};
 use library::WallpaperLibrary;
 use app_event::{AppEvent, WallpaperInfo};
 use menubar::MenuBarManager;
@@ -214,6 +216,11 @@ impl AppState {
             AppEvent::ScreensChanged => {
                 self.handle_screens_changed();
             }
+            AppEvent::SetStatusLine(text) => {
+                if let Some(ref manager) = self.menu_manager {
+                    manager.show_status(text.as_deref());
+                }
+            }
             AppEvent::ConfigReloaded(new_config) => {
                 println!("Applying reloaded configuration: {:?}", new_config);
 
@@ -298,9 +305,12 @@ impl AppState {
             AppEvent::OpenWallpaperFolder => {
                 if let Some(ref dir) = self.library.dir_path {
                     println!("Opening wallpaper folder in Finder: {:?}", dir);
-                    let _ = std::process::Command::new("open")
-                        .arg(dir)
-                        .status();
+                    // NSWorkspace is non-blocking; the old `open` subprocess
+                    // waited for Finder to exit before returning.
+                    let url = NSURL::fileURLWithPath(&NSString::from_str(
+                        &dir.to_string_lossy(),
+                    ));
+                    NSWorkspace::sharedWorkspace().openURL(&url);
                 }
             }
             AppEvent::DownloadRandomWallpaper => {
@@ -309,25 +319,43 @@ impl AppState {
                     let tx = self.event_tx.clone();
                     let dl_dir = dir.clone();
                     let url = self.random_wallpaper_url.clone();
+                    // Persistent "in flight" hint; replaced by the outcome below
+                    util::send_event(&tx, AppEvent::SetStatusLine(Some("正在获取随机壁纸…".to_string())));
                     tokio::spawn(async move {
-                        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(PathBuf, Vec<PathBuf>)> {
-                            let path = wallpaper::download_random_wallpaper(&dl_dir, &url)?;
-                            println!("Downloaded: {:?}", path);
-                            let wallpapers = library::collect_wallpapers(&dl_dir);
-                            Ok((dl_dir, wallpapers))
-                        }).await;
+                        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(PathBuf, Vec<PathBuf>, String)> {
+                                let path = wallpaper::download_random_wallpaper(&dl_dir, &url)?;
+                                let display_name = path.file_name()
+                                    .and_then(|f| f.to_str())
+                                    .unwrap_or("壁纸")
+                                    .to_string();
+                                println!("Downloaded: {:?}", path);
+                                let wallpapers = library::collect_wallpapers(&dl_dir);
+                                Ok((dl_dir, wallpapers, display_name))
+                            }).await;
 
                         match res {
-                            Ok(Ok((dir_path, wallpapers))) => {
+                            Ok(Ok((dir_path, wallpapers, name))) => {
                                 util::send_event(&tx, AppEvent::DirectoryScanned {
                                     dir_path,
                                     wallpapers,
                                 });
+                                util::flash_status(&tx, format!("已保存 {}", name), 5);
+                                notification::post("随机壁纸已保存", &name);
                             }
-                            Ok(Err(e)) => eprintln!("Failed to download wallpaper: {:?}", e),
-                            Err(e) => eprintln!("Download wallpaper task joined with error: {:?}", e),
+                            Ok(Err(e)) => {
+                                eprintln!("Failed to download wallpaper: {:?}", e);
+                                util::flash_status(&tx, "随机壁纸下载失败".to_string(), 6);
+                                notification::post("随机壁纸下载失败", &format!("{:#}", e));
+                            }
+                            Err(e) => {
+                                eprintln!("Download wallpaper task joined with error: {:?}", e);
+                                util::flash_status(&tx, "随机壁纸下载失败".to_string(), 6);
+                                notification::post("随机壁纸下载失败", "后台任务异常退出");
+                            }
                         }
                     });
+                } else {
+                    util::flash_status(&self.event_tx, "尚未配置壁纸目录".to_string(), 4);
                 }
             }
             AppEvent::WallpaperProcessed { sequence_id, original_path, filtered_path, screen_number, ref info } => {
@@ -338,6 +366,7 @@ impl AppState {
                     if let Some(target_screen) = screen::find_screen_by_number(self.mtm, screen_number) {
                         if let Err(e) = wallpaper::set_wallpaper_with_fade(self.mtm, &target_screen, &filtered_path) {
                             eprintln!("Error setting wallpaper: {:?}", e);
+                            util::flash_status(&self.event_tx, "设置壁纸失败".to_string(), 5);
                         }
                     }
 
@@ -534,9 +563,11 @@ impl AppState {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Background wallpaper processing error: {:?}", e);
+                    util::send_event(&event_tx, AppEvent::SetStatusLine(Some("壁纸处理失败".to_string())));
                 }
                 Err(e) => {
                     eprintln!("Background wallpaper task joined with error: {:?}", e);
+                    util::send_event(&event_tx, AppEvent::SetStatusLine(Some("壁纸处理失败".to_string())));
                 }
             }
         });
@@ -833,5 +864,7 @@ fn main() {
     };
 
     println!("WallFlow starting event loop...");
+    // Provisional notification rights for download results (no prompt)
+    notification::request_authorization();
     app.run();
 }

@@ -98,6 +98,8 @@ pub enum AppEvent {
     /// The set of connected displays changed (hot-plug, resolution change).
     /// Reconciles per-screen state and rebuilds the display submenu.
     ScreensChanged,
+    /// Transient text on the menu status line (None clears it).
+    SetStatusLine(Option<String>),
     WallpaperProcessed {
         sequence_id: u64,
         original_path: std::path::PathBuf,

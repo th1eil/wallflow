@@ -163,9 +163,11 @@ impl MenuTarget {
 }
 
 pub struct MenuBarManager {
-    _status_item: Retained<NSStatusItem>,
+    _status_item_bar: Retained<NSStatusItem>,
     _menu_target: Retained<MenuTarget>,
     menu: Retained<NSMenu>,
+    /// Transient feedback line (下载中/失败原因…), hidden when empty.
+    status_item: Retained<NSMenuItem>,
     thumbnail_item: Retained<NSMenuItem>,
     info_item: Retained<NSMenuItem>,
     pause_item: Retained<NSMenuItem>,
@@ -223,6 +225,7 @@ impl MenuBarManager {
         }
 
         // Thumbnail Item
+        let status_line = NSMenuItem::new(mtm);
         let thumbnail_item = NSMenuItem::new(mtm);
         let info_item = NSMenuItem::new(mtm);
         let mut preset_items: Vec<(&'static str, Retained<NSMenuItem>)> = Vec::new();
@@ -231,6 +234,11 @@ impl MenuBarManager {
         let pause_item: Retained<NSMenuItem>;
         let ctrl_parent_item: Retained<NSMenuItem>;
         unsafe {
+            status_line.setTitle(&NSString::from_str(""));
+            status_line.setEnabled(false);
+            status_line.setHidden(true);
+            menu.addItem(&status_line);
+
             thumbnail_item.setTitle(&NSString::from_str("暂无壁纸"));
             thumbnail_item.setEnabled(false);
             menu.addItem(&thumbnail_item);
@@ -425,9 +433,10 @@ impl MenuBarManager {
         // 显示器 submenu 初始内容在 AppState 初始化时通过
         // rebuild_screen_menu() 填充（main.rs 启动块）。
         Self {
-            _status_item: status_item,
+            _status_item_bar: status_item,
             _menu_target: menu_target,
             menu,
+            status_item: status_line,
             thumbnail_item,
             info_item,
             pause_item,
@@ -495,6 +504,14 @@ impl MenuBarManager {
                 self.thumbnail_item.setImage(None);
             }
         }
+    }
+
+    /// Show or clear the transient status line above the thumbnail.
+    /// The row is hidden while empty so the menu stays compact.
+    pub fn show_status(&self, text: Option<&str>) {
+        let t = text.unwrap_or("");
+        self.status_item.setTitle(&NSString::from_str(t));
+        self.status_item.setHidden(t.is_empty());
     }
 
     /// Update checkmark state for screen selection menu items.
