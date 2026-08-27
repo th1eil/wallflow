@@ -89,6 +89,30 @@ pub enum FilterPreset {
 }
 
 impl FilterPreset {
+    /// All presets paired with their menu tag. Single source of truth for
+    /// both building the menu and reverse-mapping params back to a tag.
+    pub const PRESETS: [(&'static str, FilterPreset); 10] = [
+        ("original", FilterPreset::Original),
+        ("vintage", FilterPreset::Vintage),
+        ("film", FilterPreset::Film),
+        ("bw", FilterPreset::BlackAndWhite),
+        ("muted", FilterPreset::Muted),
+        ("japanese", FilterPreset::Japanese),
+        ("cyberpunk", FilterPreset::Cyberpunk),
+        ("dark", FilterPreset::Dark),
+        ("sunshine", FilterPreset::Sunshine),
+        ("forest", FilterPreset::Forest),
+    ];
+
+    /// The menu tag identifying this preset.
+    pub fn tag(self) -> &'static str {
+        Self::PRESETS
+            .iter()
+            .find(|(_, p)| *p == self)
+            .map(|(tag, _)| *tag)
+            .unwrap_or("original")
+    }
+
     /// Convert preset to concrete FilterParams values
     pub fn to_params(self) -> FilterParams {
         match self {
@@ -134,6 +158,15 @@ impl FilterPreset {
             },
         }
     }
+}
+
+/// Reverse lookup: which preset (if any) produces exactly these params.
+/// Returns None for arbitrary/manual values, so the menu shows no checkmark.
+pub fn preset_tag_for_params(params: &FilterParams) -> Option<&'static str> {
+    FilterPreset::PRESETS
+        .iter()
+        .find(|(_, p)| p.to_params() == *params)
+        .map(|(tag, _)| *tag)
 }
 
 pub struct FilterPipeline {

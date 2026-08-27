@@ -20,8 +20,10 @@ use util::TempFileGuard;
 use objc2::{define_class, msg_send, ClassType, MainThreadOnly, sel, DefinedClass};
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::NSObject;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSString};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDidChangeScreenParametersNotification,
+};
+use objc2_foundation::{MainThreadMarker, NSNotificationCenter, NSObjectProtocol};
 use library::WallpaperLibrary;
 use app_event::{AppEvent, WallpaperInfo};
 use menubar::MenuBarManager;
@@ -129,6 +131,10 @@ impl AppState {
                 if let Some(screen_state) = self.screens.get_mut(&sn) {
                     screen_state.current_filters = preset.to_params();
                 }
+                // Mark the chosen preset in the menu
+                if let Some(ref manager) = self.menu_manager {
+                    manager.set_preset_tag(Some(preset.tag()));
+                }
                 // Re-apply current wallpaper with the new filter on the active screen
                 if let Some(curr_idx) = self.library.current_index {
                     if curr_idx < self.library.wallpapers.len() {
@@ -166,24 +172,47 @@ impl AppState {
             }
             AppEvent::TogglePause => {
                 let sn = self.active_screen_number;
-                if let Some(screen_state) = self.screens.get(&sn) {
-                    screen_state.dynamic_player.send_command(playback::PlaybackCommand::Pause);
-                    screen_state.video_player.send_command(playback::PlaybackCommand::Pause);
+                if let Some(screen_state) = self.screens.get_mut(&sn) {
+                    // ScreenState owns the toggle; player commands are absolute
+                    // Pause/Resume (the tasks treat them as set, not toggle).
+                    screen_state.paused = !screen_state.paused;
+                    let cmd = if screen_state.paused {
+                        playback::PlaybackCommand::Pause
+                    } else {
+                        playback::PlaybackCommand::Resume
+                    };
+                    screen_state.dynamic_player.send_command(cmd.clone());
+                    screen_state.video_player.send_command(cmd);
+                }
+                if let Some(ref manager) = self.menu_manager {
+                    let paused = self.screens.get(&sn).map(|s| s.paused).unwrap_or(false);
+                    manager.set_paused(paused);
                 }
             }
             AppEvent::SetLoopMode(mode) => {
                 let sn = self.active_screen_number;
-                if let Some(screen_state) = self.screens.get(&sn) {
+                if let Some(screen_state) = self.screens.get_mut(&sn) {
+                    screen_state.loop_mode = mode;
                     screen_state.dynamic_player.send_command(playback::PlaybackCommand::SetLoopMode(mode));
                     screen_state.video_player.send_command(playback::PlaybackCommand::SetLoopMode(mode));
+                }
+                if let Some(ref manager) = self.menu_manager {
+                    manager.set_loop_mode(mode);
                 }
             }
             AppEvent::SetFps(fps) => {
                 let sn = self.active_screen_number;
-                if let Some(screen_state) = self.screens.get(&sn) {
+                if let Some(screen_state) = self.screens.get_mut(&sn) {
+                    screen_state.fps_override = fps;
                     screen_state.dynamic_player.send_command(playback::PlaybackCommand::SetFps(fps));
                     screen_state.video_player.send_command(playback::PlaybackCommand::SetFps(fps));
                 }
+                if let Some(ref manager) = self.menu_manager {
+                    manager.set_fps(fps);
+                }
+            }
+            AppEvent::ScreensChanged => {
+                self.handle_screens_changed();
             }
             AppEvent::ConfigReloaded(new_config) => {
                 println!("Applying reloaded configuration: {:?}", new_config);
@@ -206,6 +235,11 @@ impl AppState {
                     screen_state.current_filters = new_filters;
                 }
 
+                // Checkmark the matching preset, or clear when values are manual
+                if let Some(ref manager) = self.menu_manager {
+                    manager.set_preset_tag(color::preset_tag_for_params(&new_filters));
+                }
+
                 // 3. Update scheduler interval
                 self.scheduler.start(new_config.interval_secs);
 
@@ -223,7 +257,7 @@ impl AppState {
                             let wallpapers = tokio::task::spawn_blocking(move || {
                                 library::collect_wallpapers(&scan_dir)
                             }).await.unwrap_or_default();
-                            let _ = tx.send(AppEvent::DirectoryScanned {
+                            util::send_event(&tx, AppEvent::DirectoryScanned {
                                 dir_path: dir,
                                 wallpapers,
                             });
@@ -242,32 +276,21 @@ impl AppState {
             }
             AppEvent::ChooseDirectory => {
                 println!("Opening directory picker...");
-                unsafe {
-                    let name = std::ffi::CStr::from_bytes_with_nul(b"NSOpenPanel\0").unwrap();
-                    let panel_class = objc2::runtime::AnyClass::get(name);
-                    if let Some(cls) = panel_class {
-                        let panel: Retained<NSObject> = msg_send![cls, openPanel];
-                        let _: () = msg_send![&*panel, setCanChooseDirectories: true];
-                        let _: () = msg_send![&*panel, setCanChooseFiles: false];
-                        let _: () = msg_send![&*panel, setAllowsMultipleSelection: false];
+                let start_dir = self.library.dir_path.clone();
+                if let Some(new_path) = util::run_open_directory_panel(
+                    self.mtm,
+                    "选择",
+                    "选择包含壁纸的文件夹",
+                    start_dir.as_deref(),
+                ) {
+                    println!("User selected wallpaper directory: {}", new_path.display());
 
-                        let response: isize = msg_send![&*panel, runModal];
-                        if response == 1 {
-                            let url: Option<Retained<NSObject>> = msg_send![&*panel, URL];
-                            if let Some(u) = url {
-                                let path_ns: Retained<NSString> = msg_send![&*u, path];
-                                let new_path = path_ns.to_string();
-                                println!("User selected wallpaper directory: {}", new_path);
-
-                                // Write back to config.toml
-                                if let Ok(mut current_config) = config::load_or_create_config() {
-                                    current_config.wallpaper_dir = new_path;
-                                    if let Ok(content) = toml::to_string_pretty(&current_config) {
-                                        let config_path = config::get_config_path();
-                                        let _ = std::fs::write(config_path, content);
-                                    }
-                                }
-                            }
+                    // Write back to config.toml
+                    if let Ok(mut current_config) = config::load_or_create_config() {
+                        current_config.wallpaper_dir = new_path.to_string_lossy().to_string();
+                        if let Ok(content) = toml::to_string_pretty(&current_config) {
+                            let config_path = config::get_config_path();
+                            let _ = std::fs::write(config_path, content);
                         }
                     }
                 }
@@ -296,7 +319,7 @@ impl AppState {
 
                         match res {
                             Ok(Ok((dir_path, wallpapers))) => {
-                                let _ = tx.send(AppEvent::DirectoryScanned {
+                                util::send_event(&tx, AppEvent::DirectoryScanned {
                                     dir_path,
                                     wallpapers,
                                 });
@@ -324,6 +347,8 @@ impl AppState {
                             let _ = std::fs::remove_file(old_path);
                         }
                         screen_state.last_static_path = Some(filtered_path.clone());
+                        screen_state.content_kind = screen::ContentKind::Static;
+                        screen_state.paused = false;
                     }
 
                     // Update menu thumbnail (show last-set image regardless of screen)
@@ -333,6 +358,7 @@ impl AppState {
                             .unwrap_or("Wallpaper");
                         manager.update_thumbnail(filename, Some(&filtered_path), Some(info));
                     }
+                    self.sync_menu_state();
                 } else {
                     println!("Ignoring obsolete wallpaper process result for sequence {}", sequence_id);
                     let _ = std::fs::remove_file(filtered_path);
@@ -369,6 +395,10 @@ impl AppState {
         if ext == "gif" {
             println!("Playing dynamic wallpaper on screen {}: {:?}", screen_number, path);
             if let Some(screen_state) = self.screens.get_mut(&screen_number) {
+                screen_state.content_kind = screen::ContentKind::Dynamic;
+                screen_state.paused = false;
+                screen_state.loop_mode = playback::LoopMode::Infinite;
+                screen_state.fps_override = 0;
                 if let Err(e) = screen_state.dynamic_player.play(
                     path,
                     playback::LoopMode::Infinite,
@@ -378,6 +408,7 @@ impl AppState {
                     eprintln!("Failed to play GIF wallpaper: {:?}", e);
                 }
             }
+            self.sync_menu_state();
             return;
         }
 
@@ -385,6 +416,10 @@ impl AppState {
         if ext == "png" && dynamic::is_apng(path) {
             println!("Playing APNG dynamic wallpaper on screen {}: {:?}", screen_number, path);
             if let Some(screen_state) = self.screens.get_mut(&screen_number) {
+                screen_state.content_kind = screen::ContentKind::Dynamic;
+                screen_state.paused = false;
+                screen_state.loop_mode = playback::LoopMode::Infinite;
+                screen_state.fps_override = 0;
                 if let Err(e) = screen_state.dynamic_player.play(
                     path,
                     playback::LoopMode::Infinite,
@@ -394,6 +429,7 @@ impl AppState {
                     eprintln!("Failed to play APNG wallpaper: {:?}", e);
                 }
             }
+            self.sync_menu_state();
             return;
         }
 
@@ -401,6 +437,10 @@ impl AppState {
         if ext == "mp4" || ext == "webm" {
             println!("Playing video wallpaper on screen {}: {:?}", screen_number, path);
             if let Some(screen_state) = self.screens.get_mut(&screen_number) {
+                screen_state.content_kind = screen::ContentKind::Video;
+                screen_state.paused = false;
+                screen_state.loop_mode = playback::LoopMode::Infinite;
+                screen_state.fps_override = 24; // play() default
                 if let Err(e) = screen_state.video_player.play(
                     path,
                     24, // default 24 FPS
@@ -410,6 +450,7 @@ impl AppState {
                     eprintln!("Failed to play video wallpaper: {:?}", e);
                 }
             }
+            self.sync_menu_state();
             return;
         }
 
@@ -430,6 +471,8 @@ impl AppState {
                 if let Some(old_path) = screen_state.last_static_path.take() {
                     let _ = std::fs::remove_file(old_path);
                 }
+                screen_state.content_kind = screen::ContentKind::Static;
+                screen_state.paused = false;
             }
 
             if let Some(ref manager) = self.menu_manager {
@@ -439,6 +482,7 @@ impl AppState {
                 let info = WallpaperInfo::from_path(path);
                 manager.update_thumbnail(filename, Some(path), Some(&info));
             }
+            self.sync_menu_state();
             return;
         }
 
@@ -480,7 +524,7 @@ impl AppState {
 
             match res {
                 Ok(Ok((filtered_path, info))) => {
-                    let _ = event_tx.send(AppEvent::WallpaperProcessed {
+                    util::send_event(&event_tx, AppEvent::WallpaperProcessed {
                         sequence_id,
                         original_path,
                         filtered_path,
@@ -496,6 +540,69 @@ impl AppState {
                 }
             }
         });
+
+        self.sync_menu_state();
+    }
+
+    /// Push playback-related UI state (pause title, checkmarks, control
+    /// enablement) for the active screen into the menu.
+    fn sync_menu_state(&self) {
+        let Some(ref manager) = self.menu_manager else { return };
+        let ss = self.screens.get(&self.active_screen_number);
+        let is_playback = matches!(
+            ss.map(|s| s.content_kind),
+            Some(screen::ContentKind::Dynamic) | Some(screen::ContentKind::Video)
+        );
+        manager.set_playback_enabled(is_playback);
+        manager.set_paused(ss.map(|s| s.paused).unwrap_or(false));
+        manager.set_loop_mode(ss.map(|s| s.loop_mode).unwrap_or(playback::LoopMode::Infinite));
+        manager.set_fps(ss.map(|s| s.fps_override).unwrap_or(0));
+    }
+
+    /// Reconcile per-screen state with the current display list and rebuild
+    /// the 显示器 submenu. Fired by NSApplicationDidChangeScreenParameters.
+    fn handle_screens_changed(&mut self) {
+        let screens = wallpaper::get_screens(self.mtm);
+        let mut entries: Vec<(u32, String)> = Vec::with_capacity(screens.len());
+        for (i, s) in screens.iter().enumerate() {
+            let num = screen::screen_number(s);
+            entries.push((num, format!("显示器 {} ({})", i + 1, crate::screen::screen_resolution(s))));
+        }
+        let current: Vec<u32> = entries.iter().map(|(n, _)| *n).collect();
+
+        // Tear down screens that disappeared
+        let stale: Vec<u32> = self.screens
+            .keys()
+            .filter(|n| !current.contains(n))
+            .copied()
+            .collect();
+        for num in stale {
+            if let Some(ss) = self.screens.remove(&num) {
+                ss.dynamic_player.stop();
+                ss.video_player.stop();
+                if let Some(p) = ss.last_static_path {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+
+        // Create state for newly connected screens
+        for num in &current {
+            self.screens.entry(*num)
+                .or_insert_with(|| screen::ScreenState::new(*num, self.event_tx.clone()));
+        }
+
+        // Fall back to a valid screen when the active one disconnected
+        if !self.screens.contains_key(&self.active_screen_number) {
+            self.active_screen_number = current.first().copied().unwrap_or(0);
+        }
+
+        let active = self.active_screen_number;
+        if let Some(ref manager) = self.menu_manager {
+            manager.rebuild_screen_menu(self.mtm, &entries, active);
+            manager.set_active_screen(active);
+        }
+        self.sync_menu_state();
     }
 }
 
@@ -541,12 +648,23 @@ define_class!(
 
         #[unsafe(method(timerTick:))]
         unsafe fn timer_tick(&self, _timer: *mut NSObject) {
-            let rx_lock = self.ivars().event_rx.lock().unwrap();
-            if let (Some(ref rx), Some(state_arc)) = (&*rx_lock, self.ivars().state.get()) {
-                while let Ok(event) = rx.try_recv() {
-                    if let Ok(mut state) = state_arc.lock() {
-                        state.handle_event(event);
-                    }
+            self.drain();
+        }
+
+        /// Selector used by util::wake_main_loop to drain immediately after a
+        /// send from any thread. Invoked asynchronously on the main run loop.
+        #[unsafe(method(drainEvents:))]
+        unsafe fn drain_events(&self, _sender: *mut NSObject) {
+            self.drain();
+        }
+
+        /// NSApplicationDidChangeScreenParametersNotification landed:
+        /// displays were connected/disconnected or changed resolution.
+        #[unsafe(method(screenParamsChanged:))]
+        unsafe fn screen_params_changed(&self, _note: *mut NSObject) {
+            if let Some(state_arc) = self.ivars().state.get() {
+                if let Ok(mut state) = state_arc.lock() {
+                    state.handle_event(AppEvent::ScreensChanged);
                 }
             }
         }
@@ -556,6 +674,17 @@ define_class!(
 );
 
 impl TimerTarget {
+    fn drain(&self) {
+        let rx_lock = self.ivars().event_rx.lock().unwrap();
+        if let (Some(ref rx), Some(state_arc)) = (&*rx_lock, self.ivars().state.get()) {
+            while let Ok(event) = rx.try_recv() {
+                if let Ok(mut state) = state_arc.lock() {
+                    state.handle_event(event);
+                }
+            }
+        }
+    }
+
     pub fn set_state_and_rx(&self, state: Arc<Mutex<AppState>>, event_rx: Receiver<AppEvent>) {
         let _ = self.ivars().state.set(state);
         *self.ivars().event_rx.lock().unwrap() = Some(event_rx);
@@ -592,6 +721,21 @@ fn main() {
     let timer_target: Retained<TimerTarget> = unsafe { msg_send![TimerTarget::class(), new] };
     timer_target.set_state_and_rx(state.clone(), event_rx);
 
+    // Event senders wake the drain immediately from any thread
+    util::register_wake_target(Retained::as_ptr(&timer_target) as *mut NSObject);
+
+    // Track display connect/disconnect/resolution changes
+    unsafe {
+        let center = NSNotificationCenter::defaultCenter();
+        let observer_target: *mut NSObject = Retained::as_ptr(&timer_target) as *mut NSObject;
+        center.addObserver_selector_name_object(
+            &*observer_target,
+            sel!(screenParamsChanged:),
+            Some(NSApplicationDidChangeScreenParametersNotification),
+            None,
+        );
+    }
+
     // Initialize state
     {
         let mut locked_state = state.lock().unwrap();
@@ -618,6 +762,31 @@ fn main() {
         // Start auto-switch scheduler
         locked_state.scheduler.start(initial_config.interval_secs);
 
+        // Initial menu UI state: display submenu, preset checkmark, playback controls
+        {
+            let entries: Vec<(u32, String)> = wallpaper::get_screens(mtm)
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (
+                    screen::screen_number(s),
+                    format!("显示器 {} ({})", i + 1, screen::screen_resolution(s)),
+                ))
+                .collect();
+            if let Some(ref manager) = locked_state.menu_manager {
+                manager.rebuild_screen_menu(mtm, &entries, locked_state.active_screen_number);
+                manager.set_active_screen(locked_state.active_screen_number);
+                let init_filters_menu = color::FilterParams {
+                    brightness: initial_config.filters.brightness * 100.0,
+                    contrast: initial_config.filters.contrast * 100.0,
+                    saturation: initial_config.filters.saturation * 100.0,
+                    temperature: initial_config.filters.temperature * 100.0,
+                    blur: initial_config.filters.blur,
+                };
+                manager.set_preset_tag(color::preset_tag_for_params(&init_filters_menu));
+            }
+            locked_state.sync_menu_state();
+        }
+
         // Scan configured wallpaper directory
         let pictures_dir = std::path::PathBuf::from(&initial_config.wallpaper_dir);
         if pictures_dir.exists() {
@@ -629,7 +798,7 @@ fn main() {
                 let wallpapers = tokio::task::spawn_blocking(move || {
                     library::collect_wallpapers(&scan_dir)
                 }).await.unwrap_or_default();
-                let _ = event_tx_clone.send(AppEvent::DirectoryScanned {
+                util::send_event(&event_tx_clone, AppEvent::DirectoryScanned {
                     dir_path: dir,
                     wallpapers,
                 });
@@ -649,11 +818,13 @@ fn main() {
         }
     };
 
-    // Schedule 150ms periodic event poll timer on the main run loop
+    // Fallback poll timer on the main run loop. Normal latency is near-zero
+    // because senders wake the drain directly (util::send_event); this only
+    // covers missed wakes and runs rarely.
     let _timer: Retained<NSObject> = unsafe {
         msg_send![
             objc2_foundation::NSTimer::class(),
-            scheduledTimerWithTimeInterval: 0.150f64,
+            scheduledTimerWithTimeInterval: 1.0f64,
             target: &*timer_target,
             selector: sel!(timerTick:),
             userInfo: None::<&NSObject>,

@@ -6,7 +6,22 @@ use objc2_app_kit::NSScreen;
 use objc2_foundation::{MainThreadMarker, NSString};
 use crate::color::FilterParams;
 use crate::dynamic::DynamicWallpaperPlayer;
+use crate::playback::LoopMode;
 use crate::video::VideoWallpaperPlayer;
+
+/// What kind of wallpaper is currently shown on a screen — drives whether
+/// playback controls are enabled and which preview path filters can take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentKind {
+    /// Nothing applied yet
+    None,
+    /// Static image (may carry GPU/CPU filters)
+    Static,
+    /// GIF / APNG via DynamicWallpaperPlayer
+    Dynamic,
+    /// MP4 / WebM via VideoWallpaperPlayer
+    Video,
+}
 
 /// Extract the unique per-display identifier from an NSScreen.
 /// Uses NSScreenNumber from the device description dictionary — a stable u32
@@ -41,6 +56,16 @@ pub struct ScreenState {
     pub video_player: VideoWallpaperPlayer,
     pub last_static_path: Option<PathBuf>,
     pub static_counter: u64,
+    /// What's on screen now (Static/Dynamic/Video), so the UI can react.
+    pub content_kind: ContentKind,
+    /// Main-thread mirror of the players' pause state. Both player tasks treat
+    /// PlaybackCommand::Pause/Resume as absolute set, not toggle — so AppState
+    /// owns the toggle here and sends the matching explicit command.
+    pub paused: bool,
+    /// Mirrors playback settings last sent to this screen's players.
+    pub loop_mode: LoopMode,
+    /// 0 = native timing (menu label 原始).
+    pub fps_override: u32,
 }
 
 impl ScreenState {
@@ -55,6 +80,10 @@ impl ScreenState {
             video_player: VideoWallpaperPlayer::new(event_tx),
             last_static_path: None,
             static_counter: 0,
+            content_kind: ContentKind::None,
+            paused: false,
+            loop_mode: LoopMode::Infinite,
+            fps_override: 0,
         }
     }
 }

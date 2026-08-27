@@ -100,7 +100,7 @@ pub fn watch_config(tx: std::sync::mpsc::Sender<AppEvent>) -> Result<notify::Rec
                                 *last = Instant::now();
                                 println!("Config change detected, reloading...");
                                 if let Ok(new_config) = load_or_create_config() {
-                                    let _ = tx.send(AppEvent::ConfigReloaded(new_config));
+                                    crate::util::send_event(&tx, AppEvent::ConfigReloaded(new_config));
                                 }
                             }
                         }

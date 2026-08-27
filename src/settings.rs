@@ -121,21 +121,13 @@ define_class!(
                 *lock
             };
             if let Some(ptrs) = ptrs {
-                let name = std::ffi::CStr::from_bytes_with_nul(b"NSOpenPanel\0").unwrap();
-                if let Some(cls) = objc2::runtime::AnyClass::get(name) {
-                    let panel: Retained<NSObject> = msg_send![cls, openPanel];
-                    let _: () = msg_send![&*panel, setCanChooseDirectories: true];
-                    let _: () = msg_send![&*panel, setCanChooseFiles: false];
-                    let _: () = msg_send![&*panel, setAllowsMultipleSelection: false];
+                let current_ns: Retained<NSString> = msg_send![ptrs.dir_label, stringValue];
+                let current = current_ns.to_string();
+                let start_dir = if current.is_empty() { None } else { Some(std::path::PathBuf::from(current)) };
 
-                    let response: isize = msg_send![&*panel, runModal];
-                    if response == 1 {
-                        let url: Option<Retained<NSObject>> = msg_send![&*panel, URL];
-                        if let Some(u) = url {
-                            let path_ns: Retained<NSString> = msg_send![&*u, path];
-                            let _: () = msg_send![ptrs.dir_label, setStringValue: &*path_ns];
-                        }
-                    }
+                let mtm = self.ivars().mtm;
+                if let Some(path) = crate::util::run_open_directory_panel(mtm, "选择", "选择包含壁纸的文件夹", start_dir.as_deref()) {
+                    let _: () = msg_send![ptrs.dir_label, setStringValue: &*NSString::from_str(&path.to_string_lossy())];
                 }
             }
         }
@@ -200,7 +192,7 @@ define_class!(
                 }
 
                 if let Some(ref tx) = *self.ivars().event_tx.lock().unwrap() {
-                    let _ = tx.send(crate::app_event::AppEvent::ConfigReloaded(new_config));
+                    crate::util::send_event(tx, crate::app_event::AppEvent::ConfigReloaded(new_config));
                 }
 
                 let _: () = msg_send![ptrs.window, close];

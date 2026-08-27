@@ -189,7 +189,7 @@ impl DynamicWallpaperPlayer {
                 if let Err(e) = img.save(target_path) {
                     eprintln!("Failed to save dynamic frame: {:?}", e);
                 } else {
-                    let _ = tx.send(AppEvent::SetDynamicFrame {
+                    crate::util::send_event(&tx, AppEvent::SetDynamicFrame {
                         screen_number,
                         path: target_path.clone(),
                     });

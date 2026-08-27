@@ -33,7 +33,7 @@ impl WallpaperScheduler {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let _ = tx.send(AppEvent::Next);
+                        crate::util::send_event(&tx, AppEvent::Next);
                     }
                     _ = &mut cancel_rx => {
                         break;

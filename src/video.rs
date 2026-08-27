@@ -141,7 +141,7 @@ fn video_loop(
             if let Some(png_bytes) = grab_frame(&*generator, current_time) {
                 let target_path = if use_a { &path_a } else { &path_b };
                 if std::fs::write(target_path, &png_bytes).is_ok() {
-                    let _ = tx.send(AppEvent::SetDynamicFrame {
+                    crate::util::send_event(&tx, AppEvent::SetDynamicFrame {
                         screen_number,
                         path: target_path.clone(),
                     });

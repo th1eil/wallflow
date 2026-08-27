@@ -41,7 +41,8 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSControl",
     "NSTextField",
     "NSSlider",
-    "NSPopUpButton"
+    "NSPopUpButton",
+    "NSOpenPanel"
 ] }
 objc2-av-foundation = { version = "0.3.2" }
 # CoreVideo and CoreMedia

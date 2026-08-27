@@ -95,6 +95,9 @@ pub enum AppEvent {
     DownloadRandomWallpaper,
     /// Open the current wallpaper directory in Finder.
     OpenWallpaperFolder,
+    /// The set of connected displays changed (hot-plug, resolution change).
+    /// Reconciles per-screen state and rebuilds the display submenu.
+    ScreensChanged,
     WallpaperProcessed {
         sequence_id: u64,
         original_path: std::path::PathBuf,
