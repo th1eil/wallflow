@@ -42,12 +42,20 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSTextField",
     "NSSlider",
     "NSPopUpButton",
-    "NSOpenPanel"
+    "NSOpenPanel",
+    "NSStackView",
+    "NSImageView",
+    "NSScrollView",
+    "NSVisualEffectView",
+    "NSLayoutConstraint",
+    "NSLayoutAnchor"
 ] }
 objc2-av-foundation = { version = "0.3.2" }
 # CoreVideo and CoreMedia
 objc2-core-video = { version = "0.3.2" }
 objc2-core-media = { version = "0.3.2" }
+# CGColorRef 类型编码（CALayer shadowColor 需要，debug 构建会校验方法签名）
+objc2-core-graphics = { version = "0.3.2", features = ["CGColor"] }
 # macOS system notifications (download finished / failure feedback)
 objc2-user-notifications = { version = "0.3.1", features = [
     "UNUserNotificationCenter",

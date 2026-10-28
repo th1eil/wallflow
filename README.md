@@ -90,6 +90,7 @@ src/
 ├── color.rs         GPU 滤镜管线（wgpu）+ CPU 回退
 ├── config.rs        TOML 配置读写 + 热重载
 ├── settings.rs      原生设置面板（NSWindow）
+├── settings_ui.rs   设置面板的分类导航与布局
 └── shader.wgsl      WGSL 着色器（滤镜 + 高斯模糊）
 ```
 

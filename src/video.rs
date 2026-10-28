@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, Sender};
 use crate::app_event::AppEvent;
 use crate::playback::{LoopMode, PlaybackCommand};
+use crate::contrast;
 use objc2::msg_send;
 use objc2::runtime::NSObject;
 use objc2_foundation::{NSString, NSURL, NSDictionary, NSSize};
@@ -24,12 +25,18 @@ impl VideoWallpaperPlayer {
         Self { tx, command_tx: None }
     }
 
+    /// - `fps`: frame rate to extract at
+    /// - `loop_mode`: how to loop (Infinite / PlayOnce / PingPong)
+    /// - `screen_number`: which screen to target with SetDynamicFrame events
+    /// - `band`: 亮度采样矩形（比例坐标，图像坐标系 y 向下），由
+    ///   `ClockManager::sample_band()` 给出 —— 已限制在时钟范围内
     pub fn play(
         &mut self,
         path: &Path,
         fps: u32,
         loop_mode: LoopMode,
         screen_number: u32,
+        band: (f64, f64, f64, f64),
     ) -> anyhow::Result<()> {
         self.stop();
 
@@ -64,7 +71,7 @@ impl VideoWallpaperPlayer {
 
             // Dedicated OS thread — avoids tokio's Send requirement on ObjC pointers.
             std::thread::spawn(move || {
-                video_loop(send_gen, tx, command_rx, duration, frame_interval_ms, loop_mode, screen_number);
+                video_loop(send_gen, tx, command_rx, duration, frame_interval_ms, loop_mode, screen_number, band);
             });
         }
 
@@ -96,6 +103,7 @@ fn video_loop(
     frame_interval_ms: u64,
     loop_mode: LoopMode,
     screen_number: u32,
+    band: (f64, f64, f64, f64),
 ) {
     let generator = send_gen.0;
     let temp_dir = std::env::temp_dir();
@@ -109,6 +117,8 @@ fn video_loop(
     let mut current_loop = loop_mode;
     let mut frame_interval = frame_interval_ms;
     let mut direction: i32 = 1;
+    // 首帧亮度是否已经量过（视频只决策一次，见 Extract frame 处的注释）
+    let mut sampled_luma = false;
 
     // Use blocking recv with timeout for command polling
     loop {
@@ -147,6 +157,19 @@ fn video_loop(
                     });
                 }
                 use_a = !use_a;
+
+                // 只按第一帧量一次亮度。视频画面一直变，若跟随重采样，时钟文字颜色
+                // 会跟着画面频闪 —— 那比「对比度不够」更伤观感，所以与静态/GIF 路径
+                // 保持同一套「首帧决策」约定。
+                if !sampled_luma {
+                    sampled_luma = true;
+                    if let Some(luma) = measure_frame_luma(&png_bytes, band) {
+                        crate::util::send_event(&tx, AppEvent::WallpaperLuma {
+                            screen_number,
+                            luma,
+                        });
+                    }
+                }
             }
         }
 
@@ -207,6 +230,21 @@ fn video_loop(
 fn cleanup(a: &Path, b: &Path) {
     let _ = std::fs::remove_file(a);
     let _ = std::fs::remove_file(b);
+}
+
+/// 从 worker 刚生成的 PNG 帧里量一次时钟范围内的平均亮度。
+///
+/// 复用帧而不是另开一次视频解码：帧是 1280×720 的中间产物，解一次约十几毫秒，
+/// 且发生在 worker 线程上，不占用主线程，也不影响出帧节奏。
+/// 解码失败（帧数据异常）时返回 None，调用方保持上一次的采样值。
+///
+/// 注意帧的宽高比（16:9 上限）与屏幕未必一致，`band` 按比例换算时会带来
+/// 一点偏差；但采样带紧贴屏幕中心的时钟区域，两种比例下该区域的相对位置
+/// 差异很小。
+fn measure_frame_luma(png_bytes: &[u8], band: (f64, f64, f64, f64)) -> Option<f64> {
+    let img = image::load_from_memory(png_bytes).ok()?.to_rgba8();
+    let (x0, y0, x1, y1) = band;
+    Some(contrast::sample_region_luma(&img, x0, y0, x1, y1, contrast::SAMPLE_STEP))
 }
 
 fn apply_video_command(

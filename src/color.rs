@@ -11,12 +11,23 @@ pub struct FilterParams {
 }
 
 impl FilterParams {
+    /// 判「等同原图」的容差。
+    ///
+    /// 设置面板的滑块工作在 -100..100 量纲，写回配置时会留下 ±0.01 量级的浮点
+    /// 残留（实测配置里是 `-0.004998…`，换算到本结构就是 `-0.4998`）。原先按
+    /// `== 0.0` 严格判等，这类「肉眼就是原图」的参数会让每次切换都走完整滤镜
+    /// 管线：2600 万像素解码 + GPU 往返 + 全尺寸编码，代价是秒级。
+    /// 0.5 对应 0.5% 的调整量，低于肉眼可辨阈值。
+    const EPSILON: f32 = 0.5;
+    /// 模糊半径以像素计（0..20），0.05px 以下不产生可见效果。
+    const BLUR_EPSILON: f32 = 0.05;
+
     pub fn is_default(&self) -> bool {
-        self.brightness == 0.0
-            && self.contrast == 0.0
-            && self.saturation == 0.0
-            && self.temperature == 0.0
-            && self.blur == 0.0
+        self.brightness.abs() < Self::EPSILON
+            && self.contrast.abs() < Self::EPSILON
+            && self.saturation.abs() < Self::EPSILON
+            && self.temperature.abs() < Self::EPSILON
+            && self.blur.abs() < Self::BLUR_EPSILON
     }
 }
 
@@ -332,9 +343,28 @@ impl FilterPipeline {
         })
     }
 
+    /// 图片能否装进 GPU 纹理。
+    ///
+    /// wgpu 默认 `max_texture_dimension_2d = 8192`，而相机原图常见 9000×6000。
+    /// 关键点：超限时 `create_texture` 触发的是**校验错误 panic**，不是返回 Err，
+    /// 所以 `process_image` 里的 `match ... Err` 兜不住 —— 9000px 宽的壁纸会把
+    /// 工作线程直接打崩、壁纸永远设不上。必须在进 GPU 之前自己拦。
+    fn fits_device(gpu: &GpuPipeline, width: u32, height: u32) -> bool {
+        let limit = gpu.device.limits().max_texture_dimension_2d;
+        width <= limit && height <= limit
+    }
+
     /// Process the image. Uses GPU if initialized, otherwise falls back to CPU.
     pub fn process_image(&self, img: &image::RgbaImage, params: &FilterParams) -> Result<image::RgbaImage> {
         if let Some(ref gpu) = self.gpu {
+            let (w, h) = img.dimensions();
+            if !Self::fits_device(gpu, w, h) {
+                eprintln!(
+                    "Image {}×{} exceeds GPU texture limit (8192); using CPU path",
+                    w, h
+                );
+                return Ok(self.process_image_cpu(img, params));
+            }
             match self.process_image_gpu(gpu, img, params) {
                 Ok(out) => return Ok(out),
                 Err(e) => {
@@ -714,7 +744,7 @@ impl FilterPipeline {
 
         let blur_radius = params.blur as usize;
         if blur_radius > 0 {
-            out_img = gaussian_blur(&out_img, blur_radius);
+            out_img = gaussian_blur(out_img, blur_radius);
         }
 
         out_img
@@ -724,10 +754,13 @@ impl FilterPipeline {
 /// Separable Gaussian blur matching the GPU shader's `fs_blur`.
 /// Uses σ = radius and the same exp(-i²/(2σ²)) weighting as the WGSL path,
 /// so CPU fallback produces visually identical results to GPU.
-fn gaussian_blur(img: &image::RgbaImage, radius: usize) -> image::RgbaImage {
-    let (width, height) = img.dimensions();
-    let mut temp = img.clone();
-    let mut out = img.clone();
+///
+/// 取所有权而不是借用：垂直 pass 直接写回入参缓冲，整条路径只需要 2 块
+/// 同尺寸图像（原来的实现里调用方 clone 一次、函数内又 clone 两次，
+/// 2600 万像素时一块就是 106 MB）。
+fn gaussian_blur(mut src: image::RgbaImage, radius: usize) -> image::RgbaImage {
+    let (width, height) = src.dimensions();
+    let mut temp = src.clone();
 
     // Clamp radius to match GPU (1..=20) and convert to signed for loop range
     let r = radius.clamp(1, 20) as i32;
@@ -749,7 +782,7 @@ fn gaussian_blur(img: &image::RgbaImage, radius: usize) -> image::RgbaImage {
             for (k, &weight) in weights.iter().enumerate() {
                 let dx = k as i32 - r;
                 let px = (x as i32 + dx).clamp(0, width as i32 - 1) as u32;
-                let pixel = img.get_pixel(px, y);
+                let pixel = src.get_pixel(px, y);
                 r_sum += pixel[0] as f32 * weight;
                 g_sum += pixel[1] as f32 * weight;
                 b_sum += pixel[2] as f32 * weight;
@@ -785,7 +818,7 @@ fn gaussian_blur(img: &image::RgbaImage, radius: usize) -> image::RgbaImage {
                 total_weight += weight;
             }
 
-            let pixel = out.get_pixel_mut(x, y);
+            let pixel = src.get_pixel_mut(x, y);
             pixel[0] = (r_sum / total_weight) as u8;
             pixel[1] = (g_sum / total_weight) as u8;
             pixel[2] = (b_sum / total_weight) as u8;
@@ -793,5 +826,54 @@ fn gaussian_blur(img: &image::RgbaImage, radius: usize) -> image::RgbaImage {
         }
     }
 
-    out
+    src
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 滑块写回配置时会留下 ±0.01 量级残留（-100..100 量纲下约 0.5），
+    /// 这类参数必须被判成「等同原图」，否则每次切换都白跑一遍滤镜管线。
+    #[test]
+    fn is_default_tolerates_slider_jitter() {
+        let jitter = FilterParams {
+            brightness: -0.4998,
+            contrast: 0.3741,
+            saturation: -0.3741,
+            temperature: -0.4403,
+            blur: 0.0,
+        };
+        assert!(jitter.is_default(), "容差以内的残差应视为原图");
+
+        let real = FilterParams {
+            brightness: 0.6,
+            ..Default::default()
+        };
+        assert!(!real.is_default(), "超过容差必须仍然走滤镜");
+
+        // 模糊的量纲是像素，0.5px 已是可见效果，不能被吞掉
+        let blur = FilterParams {
+            blur: 0.5,
+            ..Default::default()
+        };
+        assert!(!blur.is_default());
+    }
+
+    /// CPU 回退路径（GPU 不可用时）必须仍然输出正确尺寸，且不修改入参。
+    #[test]
+    fn cpu_filter_keeps_dimensions() {
+        let img = image::RgbaImage::from_pixel(8, 4, image::Rgba([120, 130, 140, 255]));
+        let pipeline = FilterPipeline { gpu: None };
+        let out = pipeline.process_image_cpu(
+            &img,
+            &FilterParams {
+                brightness: 10.0,
+                blur: 2.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(out.dimensions(), (8, 4));
+        assert_eq!(img.get_pixel(0, 0).0, [120, 130, 140, 255], "入参不应被就地改写");
+    }
 }

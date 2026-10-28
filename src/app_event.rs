@@ -73,6 +73,21 @@ pub enum AppEvent {
     },
     /// Apply a named filter preset to the active screen
     SetFilterPreset(crate::color::FilterPreset),
+    /// Live filter preview from the settings sliders (not persisted).
+    /// Skipped automatically when the active screen shows dynamic content.
+    PreviewFilters(crate::color::FilterParams),
+    /// 滑块预览的防抖提交：`PreviewFilters` 只登记参数，等 180ms 没有新事件后
+    /// 才发这个事件真正重算。带上代数，过期的提交在代数不匹配时被丢弃。
+    CommitPreviewFilters(u64),
+    /// Live clock-overlay preview from the settings panel (not persisted).
+    /// Rebuilds the clock overlay only — the wallpaper, filters, and scheduler
+    /// are left untouched, unlike `PreviewFilters`.
+    /// 实时时钟预览（不持久化）：只重建时钟叠加层
+    PreviewClock(crate::config::ClockConfig),
+    /// 刘海黑色矩阵的实时预览（不持久化）：改开关或拖圆角滑块时立即生效，
+    /// Apply 才写盘。它画在壁纸图片里，收到后需要重渲染当前壁纸（设置面板
+    /// 侧做了 0.4s 防抖，避免拖滑块时反复编码整张图）。
+    PreviewNotch(crate::config::NotchConfig),
     /// Select which screen the navigation controls target
     SelectActiveScreen(u32),
     /// Set wallpaper on a specific screen (used by dynamic players)
@@ -87,6 +102,11 @@ pub enum AppEvent {
     },
     /// Toggle pause/resume for the active screen's dynamic player
     TogglePause,
+    /// 切换壁纸中央时钟叠加层的显示/隐藏（状态持久化到 config.toml）
+    ToggleClock,
+    /// 切换「时钟自动对比色」：壁纸与文字色对比不足时自动调整字体颜色
+    /// （判定与推色规则见 contrast.rs，状态持久化到 config.toml）
+    ToggleAutoContrast,
     /// Change loop mode for the active screen's dynamic player
     SetLoopMode(crate::playback::LoopMode),
     /// Override FPS for the active screen's dynamic player (0 = native)
@@ -100,6 +120,13 @@ pub enum AppEvent {
     ScreensChanged,
     /// Transient text on the menu status line (None clears it).
     SetStatusLine(Option<String>),
+    /// 壁纸在「时钟文字带」上的平均相对亮度采样结果（0..1），由后台采样任务发出。
+    /// 时钟据此判断是否需要把字体颜色替换为对比色（规则见 contrast.rs）。
+    /// 静态图片、GIF/APNG 首帧、视频首帧都汇总到这一个事件。
+    WallpaperLuma {
+        screen_number: u32,
+        luma: f64,
+    },
     WallpaperProcessed {
         sequence_id: u64,
         original_path: std::path::PathBuf,

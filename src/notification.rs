@@ -14,7 +14,7 @@ use block2::RcBlock;
 use objc2::runtime::Bool;
 use objc2::{msg_send, ClassType};
 use objc2::rc::Retained;
-use objc2_foundation::{NSError, NSString};
+use objc2_foundation::{NSBundle, NSError, NSString};
 use objc2_user_notifications::{
     UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
     UNNotificationSound, UNUserNotificationCenter,
@@ -25,10 +25,21 @@ static AUTHORIZED: AtomicBool = AtomicBool::new(false);
 /// Unique-per-call identifiers so repeated posts don't collapse into one.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// 裸二进制（`cargo run` 直接跑 target/debug 下的可执行文件，未经 .app 打包）
+/// 没有 bundle identifier；此时 `UNUserNotificationCenter` 会在
+/// currentNotificationCenter 处抛 NSInternalInconsistencyException 直接崩溃。
+/// 确认 bundle id 存在才继续，否则本入口降级为 no-op。
+fn notification_available() -> bool {
+    NSBundle::mainBundle().bundleIdentifier().is_some()
+}
+
 /// Ask for provisional notification delivery once at startup.
 /// The completion runs on an arbitrary system thread; results are published
 /// through the atomic flag only (thread-safe by design).
 pub fn request_authorization() {
+    if !notification_available() {
+        return;
+    }
     let block = RcBlock::new(|granted: Bool, _err: *mut NSError| {
         println!("Notification authorization granted: {}", granted.as_bool());
         AUTHORIZED.store(granted.as_bool(), Ordering::Relaxed);

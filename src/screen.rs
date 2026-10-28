@@ -46,6 +46,19 @@ pub fn screen_resolution(screen: &NSScreen) -> String {
     format!("{}x{}", w, h)
 }
 
+/// 屏幕的物理像素尺寸（逻辑点 × backingScaleFactor）。
+///
+/// 滤镜前的降采样需要的是物理像素：壁纸最终按物理像素渲染，按逻辑点缩会丢掉
+/// Retina 的 2 倍细节；而不缩又会对 6000px 的源图做无用的全量计算。
+pub fn screen_pixel_size(screen: &NSScreen) -> (u32, u32) {
+    let frame = screen.frame();
+    let scale: f64 = unsafe { msg_send![screen, backingScaleFactor] };
+    (
+        (frame.size.width * scale).round() as u32,
+        (frame.size.height * scale).round() as u32,
+    )
+}
+
 /// Per-screen independent wallpaper state.
 /// Each connected display gets its own ScreenState,
 /// allowing different wallpapers, filters, and dynamic players per screen.

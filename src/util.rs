@@ -56,6 +56,32 @@ pub fn flash_status(tx: &Sender<AppEvent>, text: String, secs: u64) {
     });
 }
 
+// Timestamp (ms since epoch) of the last config.toml write performed by the
+// app itself. Lets the hot-reload watcher skip the echo of our own write,
+// which used to re-trigger ConfigReloaded and double the work.
+static CONFIG_SELF_WRITE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Call immediately before the app writes config.toml itself.
+pub fn mark_config_self_write() {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    CONFIG_SELF_WRITE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when a self-write happened within this window — external watcher
+/// callbacks arriving this soon are almost certainly our own echo.
+pub fn was_recently_self_written() -> bool {
+    const ECHO_WINDOW_MS: i64 = 800;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let last = CONFIG_SELF_WRITE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    last > 0 && now - last < ECHO_WINDOW_MS
+}
+
 /// Present a modal directory chooser. Must be called on the main thread.
 /// Returns the selected path, or None if cancelled.
 pub fn run_open_directory_panel(

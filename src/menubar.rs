@@ -119,6 +119,22 @@ define_class!(
             }
         }
 
+        /// 切换时钟叠加层显示/隐藏。
+        #[unsafe(method(clockToggleClicked:))]
+        unsafe fn clock_toggle_clicked(&self, _sender: *mut NSObject) {
+            if let Some(ref tx) = *self.ivars().sender.lock().unwrap() {
+                crate::util::send_event(tx, AppEvent::ToggleClock);
+            }
+        }
+
+        /// 切换「自动对比色」：壁纸与文字色对比不足时自动调整字体颜色。
+        #[unsafe(method(autoContrastToggleClicked:))]
+        unsafe fn auto_contrast_toggle_clicked(&self, _sender: *mut NSObject) {
+            if let Some(ref tx) = *self.ivars().sender.lock().unwrap() {
+                crate::util::send_event(tx, AppEvent::ToggleAutoContrast);
+            }
+        }
+
         /// Set loop mode to Infinite.
         #[unsafe(method(loopInfiniteClicked:))]
         unsafe fn loop_infinite_clicked(&self, _sender: *mut NSObject) {
@@ -172,6 +188,10 @@ pub struct MenuBarManager {
     info_item: Retained<NSMenuItem>,
     pause_item: Retained<NSMenuItem>,
     ctrl_parent_item: Retained<NSMenuItem>,
+    /// 「显示时钟」开关项（勾选状态跟随 config.clock.enabled）
+    clock_item: Retained<NSMenuItem>,
+    /// 「自动对比色」开关项（勾选状态跟随 config.clock.auto_contrast）
+    auto_contrast_item: Retained<NSMenuItem>,
     // Preset items keyed by their represented tag string
     preset_items: Vec<(&'static str, Retained<NSMenuItem>)>,
     loop_items: Vec<(LoopMode, Retained<NSMenuItem>)>,
@@ -233,6 +253,8 @@ impl MenuBarManager {
         let mut fps_items: Vec<(isize, Retained<NSMenuItem>)> = Vec::new();
         let pause_item: Retained<NSMenuItem>;
         let ctrl_parent_item: Retained<NSMenuItem>;
+        let clock_item: Retained<NSMenuItem>;
+        let auto_contrast_item: Retained<NSMenuItem>;
         unsafe {
             status_line.setTitle(&NSString::from_str(""));
             status_line.setEnabled(false);
@@ -313,6 +335,26 @@ impl MenuBarManager {
             filter_preset_item.setSubmenu(Some(&filter_menu));
             filter_preset_item.setEnabled(true);
             menu.addItem(&filter_preset_item);
+
+            // --- 显示时钟开关 ---
+            let clock_toggle_item = NSMenuItem::new(mtm);
+            clock_toggle_item.setTitle(&NSString::from_str("显示时钟"));
+            clock_toggle_item.setTarget(Some(&*menu_target));
+            clock_toggle_item.setAction(Some(objc2::sel!(clockToggleClicked:)));
+            clock_toggle_item.setEnabled(true);
+            menu.addItem(&clock_toggle_item);
+            clock_item = clock_toggle_item;
+
+            // --- 自动对比色开关 ---
+            // 独立开关而非「显示时钟」的子项：时钟开着但用户想固定原色时，
+            // 关掉这一项即可，不必动显示开关。
+            let auto_contrast_toggle_item = NSMenuItem::new(mtm);
+            auto_contrast_toggle_item.setTitle(&NSString::from_str("自动对比色"));
+            auto_contrast_toggle_item.setTarget(Some(&*menu_target));
+            auto_contrast_toggle_item.setAction(Some(objc2::sel!(autoContrastToggleClicked:)));
+            auto_contrast_toggle_item.setEnabled(true);
+            menu.addItem(&auto_contrast_toggle_item);
+            auto_contrast_item = auto_contrast_toggle_item;
 
             // --- 播放控制 submenu ---
             {
@@ -441,6 +483,8 @@ impl MenuBarManager {
             info_item,
             pause_item,
             ctrl_parent_item,
+            clock_item,
+            auto_contrast_item,
             preset_items,
             loop_items,
             fps_items,
@@ -590,6 +634,20 @@ impl MenuBarManager {
     pub fn set_paused(&self, paused: bool) {
         let title = if paused { "继续" } else { "暂停" };
         self.pause_item.setTitle(&NSString::from_str(title));
+    }
+
+    /// 勾选/取消「显示时钟」菜单项。
+    pub fn set_clock_enabled(&self, enabled: bool) {
+        unsafe {
+            let _: () = msg_send![&*self.clock_item, setState: (if enabled { 1isize } else { 0isize })];
+        }
+    }
+
+    /// 勾选/取消「自动对比色」菜单项。
+    pub fn set_auto_contrast(&self, enabled: bool) {
+        unsafe {
+            let _: () = msg_send![&*self.auto_contrast_item, setState: (if enabled { 1isize } else { 0isize })];
+        }
     }
 
     /// Enable the whole 播放控制 subtree only while dynamic content shows.
