@@ -143,3 +143,10 @@ pub unsafe fn find_class(name: &str) -> anyhow::Result<&'static objc2::runtime::
     objc2::runtime::AnyClass::get(cname.as_c_str())
         .ok_or_else(|| anyhow::anyhow!("Objective-C class '{}' not found", name))
 }
+
+/// 大图解码/滤镜与亮度采样共用一个名额，避免快速切图或多屏叠加数百 MB 像素缓冲。
+/// 等待发生在异步任务内，不占用阻塞线程；permit 必须随阻塞闭包存活到处理结束。
+pub async fn image_work_permit() -> tokio::sync::SemaphorePermit<'static> {
+    static WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    WORK.acquire().await.expect("image work semaphore stays open")
+}

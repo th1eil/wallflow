@@ -4,6 +4,9 @@ use crate::app_event::AppEvent;
 use crate::playback::{LoopMode, PlaybackCommand};
 use crate::contrast;
 use objc2::msg_send;
+use objc2::rc::{autoreleasepool, Allocated, Retained};
+use objc2_av_foundation::{AVAsset, AVAssetImageGenerator};
+use objc2_core_media::CMTime;
 use objc2::runtime::NSObject;
 use objc2_foundation::{NSString, NSURL, NSDictionary, NSSize};
 use crate::util::find_class;
@@ -12,7 +15,8 @@ use crate::util::find_class;
 // Wrappers to safely move ObjC objects across thread boundaries.
 // AVAssetImageGenerator is accessed exclusively by the worker thread.
 // ---------------------------------------------------------------------------
-struct SendGenerator(*mut NSObject);
+// 持有强引用直到 worker 退出；工厂返回的 autoreleased 对象不能裸指针跨线程。
+struct SendGenerator(Retained<AVAssetImageGenerator>);
 unsafe impl Send for SendGenerator {}
 
 pub struct VideoWallpaperPlayer {
@@ -53,14 +57,14 @@ impl VideoWallpaperPlayer {
             let avurlasset_cls = find_class("AVURLAsset")?;
             let generator_cls = find_class("AVAssetImageGenerator")?;
 
-            let asset: *mut NSObject = msg_send![avurlasset_cls, URLAssetWithURL: &*url, options: None::<&NSDictionary>];
+            let asset: Retained<AVAsset> = msg_send![avurlasset_cls, URLAssetWithURL: &*url, options: None::<&NSDictionary>];
             let duration = get_duration(&*asset);
 
             if duration <= 0.0 {
                 return Err(anyhow::anyhow!("Video has zero or unknown duration"));
             }
 
-            let gen: *mut NSObject = msg_send![generator_cls, assetImageGeneratorWithAsset: &*asset];
+            let gen: Retained<AVAssetImageGenerator> = msg_send![generator_cls, assetImageGeneratorWithAsset: &*asset];
             let _: () = msg_send![&*gen, setMaximumSize: NSSize::new(1280.0, 720.0)];
 
             let send_gen = SendGenerator(gen);
@@ -146,8 +150,9 @@ fn video_loop(
             }
         }
 
-        // Extract frame
-        unsafe {
+        // 工作线程没有 AppKit 的自动释放池；逐帧清理编码产生的 NSData 等临时对象，
+        // 避免内存随着播放时长持续增长。
+        autoreleasepool(|_| unsafe {
             if let Some(png_bytes) = grab_frame(&*generator, current_time) {
                 let target_path = if use_a { &path_a } else { &path_b };
                 if std::fs::write(target_path, &png_bytes).is_ok() {
@@ -165,13 +170,14 @@ fn video_loop(
                     sampled_luma = true;
                     if let Some(luma) = measure_frame_luma(&png_bytes, band) {
                         crate::util::send_event(&tx, AppEvent::WallpaperLuma {
+                            sequence_id: None,
                             screen_number,
                             luma,
                         });
                     }
                 }
             }
-        }
+        });
 
         // Advance time
         let step = frame_interval as f64 / 1000.0;
@@ -203,7 +209,8 @@ fn video_loop(
             let elapsed = sleep_start.elapsed();
             if elapsed >= target_sleep { break; }
             let remaining = target_sleep - elapsed;
-            let poll_timeout = remaining.min(std::time::Duration::from_millis(50));
+            // recv_timeout 会在命令到达时立即唤醒，无需每 50ms 空轮询。
+            let poll_timeout = remaining;
 
             match command_rx.recv_timeout(poll_timeout) {
                 Ok(cmd) => {
@@ -270,62 +277,62 @@ fn apply_video_command(
 // ObjC FFI helpers
 // ---------------------------------------------------------------------------
 
-/// Read asset duration in seconds via KVC to avoid CMTime struct FFI.
-unsafe fn get_duration(asset: &NSObject) -> f64 {
-    let key = NSString::from_str("duration");
-    let nsvalue: *mut NSObject = msg_send![asset, valueForKey: &*key];
-    if nsvalue.is_null() { return 60.0; }
-
-    // NSValue wrapping CMTime {value:i64, timescale:i32, flags:u32, epoch:i64} = 24 bytes
-    let raw: *const u8 = msg_send![&*nsvalue, bytes];
-    if raw.is_null() { return 60.0; }
-
-    let data = std::slice::from_raw_parts(raw, 24);
-    let cm_value = i64::from_ne_bytes(data[0..8].try_into().unwrap());
-    let cm_timescale = i32::from_ne_bytes(data[8..12].try_into().unwrap());
-
-    if cm_timescale <= 0 { 60.0 }
-    else { cm_value as f64 / cm_timescale as f64 }
+/// 使用 CMTime 绑定读取时长，避免对 NSValue 发送并不存在的 bytes 消息。
+unsafe fn get_duration(asset: &AVAsset) -> f64 {
+    let time = asset.duration();
+    if time.timescale <= 0 { return 0.0; }
+    time.value as f64 / time.timescale as f64
 }
 
 /// Extract a frame as PNG bytes at `time_secs` from the generator.
-unsafe fn grab_frame(generator: &NSObject, time_secs: f64) -> Option<Vec<u8>> {
-    // Build CMTime NSValue: {value:i64, timescale:i32, flags:u32, epoch:i64}
-    let value = (time_secs * 600.0) as i64;
-    let timescale: i32 = 600;
-    let mut cm_bytes = [0u8; 24];
-    cm_bytes[0..8].copy_from_slice(&value.to_ne_bytes());
-    cm_bytes[8..12].copy_from_slice(&timescale.to_ne_bytes());
-    cm_bytes[12..16].copy_from_slice(&1i32.to_ne_bytes()); // kCMTimeFlags_Valid
+unsafe fn grab_frame(generator: &AVAssetImageGenerator, time_secs: f64) -> Option<Vec<u8>> {
+    // 原生绑定正确传递 CMTime 值，并自动释放 copy 方法返回的 CGImage，
+    // 包括下面任何提前返回的失败路径。
+    let time = CMTime::new((time_secs * 600.0) as i64, 600);
+    let cg_image = generator.copyCGImageAtTime_actualTime_error(time, std::ptr::null_mut()).ok()?;
 
-    let type_str = std::ffi::CStr::from_bytes_with_nul(b"{?=qiiq}\0").unwrap();
-    let nsvalue_cls = find_class("NSValue").ok()?;
-    let cmtime: *mut NSObject = msg_send![nsvalue_cls, valueWithBytes: cm_bytes.as_ptr(), objCType: type_str.as_ptr()];
-
-    // CGImageRef = [generator copyCGImageAtTime:cmtime actualTime:NULL error:NULL]
-    let cg_image: *mut NSObject = msg_send![generator, copyCGImageAtTime: &*cmtime, actualTime: std::ptr::null_mut::<NSObject>(), error: std::ptr::null_mut::<NSObject>()];
-    if cg_image.is_null() { return None; }
-
-    // Convert CGImage → NSImage → TIFF → BitmapRep → PNG
-    let nsimage_cls = find_class("NSImage").ok()?;
-    let nsimage: *mut NSObject = msg_send![nsimage_cls, alloc];
-    let nsimage: *mut NSObject = msg_send![nsimage, initWithCGImage: cg_image, size: NSSize::new(0.0, 0.0)];
-    if nsimage.is_null() { return None; }
-
-    let tiff: *mut NSObject = msg_send![&*nsimage, TIFFRepresentation];
-    if tiff.is_null() { return None; }
-
+    // 直接从 CGImage 创建 bitmap，省掉原先 NSImage → TIFF → bitmap 的整帧往返。
     let bitmap_cls = find_class("NSBitmapImageRep").ok()?;
-    let bitmap: *mut NSObject = msg_send![bitmap_cls, imageRepWithData: &*tiff];
-    if bitmap.is_null() { return None; }
-
-    // NSPNGFileType = 4
+    let allocated: Allocated<NSObject> = msg_send![bitmap_cls, alloc];
+    let bitmap: Option<Retained<NSObject>> = msg_send![allocated, initWithCGImage: &*cg_image];
+    let bitmap = bitmap?;
     let png: *mut NSObject = msg_send![&*bitmap, representationUsingType: crate::util::NS_PNG_FILE_TYPE, properties: None::<&NSDictionary>];
     if png.is_null() { return None; }
-
     let len: usize = msg_send![&*png, length];
-    let bytes: *const u8 = msg_send![&*png, bytes];
+    // NSData.bytes 的 ABI 是 void*，u8* 会被 objc2 编码成 C 字符串并触发校验失败。
+    let bytes: *const std::ffi::c_void = msg_send![&*png, bytes];
     if bytes.is_null() { return None; }
+    Some(std::slice::from_raw_parts(bytes.cast::<u8>(), len).to_vec())
+}
 
-    Some(std::slice::from_raw_parts(bytes, len).to_vec())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真实 H.264 小样验证原生时间结构、CGImage 所有权及直接 bitmap 编码路径。
+    /// 第一帧的 pool 释放后继续取第二帧，确保 generator 不依赖临时对象存活。
+    #[test]
+    fn native_video_frames_survive_autorelease_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.mp4");
+        std::fs::write(&path, include_bytes!("../tests/fixtures/video.mp4")).unwrap();
+        let generator = autoreleasepool(|_| unsafe {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str().unwrap()));
+            let asset = AVAsset::assetWithURL(&url);
+            assert!((get_duration(&asset) - 1.0).abs() < 0.01);
+            let class = find_class("AVAssetImageGenerator").unwrap();
+            let generator: Retained<AVAssetImageGenerator> =
+                msg_send![class, assetImageGeneratorWithAsset: &*asset];
+            generator
+        });
+        for seconds in [0.0, 0.5] {
+            let png = autoreleasepool(|_| unsafe { grab_frame(&generator, seconds) })
+                .expect("native frame extraction should succeed");
+            let frame = image::load_from_memory(&png).unwrap().to_rgb8();
+            assert_eq!(frame.dimensions(), (64, 64));
+            let pixel = frame.get_pixel(32, 32).0;
+            assert!(pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20,
+                "red video frame should keep its color: {:?}", pixel);
+        }
+    }
 }

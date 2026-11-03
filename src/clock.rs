@@ -65,6 +65,8 @@ struct ClockOverlay {
 pub struct ClockManager {
     pub config: ClockConfig,
     overlays: HashMap<u32, ClockOverlay>,
+    /// 新叠加层需要完整贴字；其余时候只更新变化的标签，避免每秒重绘大号文字。
+    last_text: Option<(String, String, Option<String>)>,
     /// 每屏壁纸在「时钟文字带」上的平均相对亮度（0..1），由 main.rs 采样后写入。
     /// 没有条目 = 还没采过样，按 0.5 中性值处理 —— 中性值不落在任何极端区，
     /// 因此不会在拿到真实亮度前乱改颜色。
@@ -82,6 +84,7 @@ impl ClockManager {
         Self {
             config,
             overlays: HashMap::new(),
+            last_text: None,
             bg_luma: HashMap::new(),
             time_width: HashMap::new(),
             text_origin: HashMap::new(),
@@ -227,6 +230,7 @@ impl ClockManager {
     }
 
     fn teardown(&mut self) {
+        self.last_text = None;
         for (_, overlay) in self.overlays.drain() {
             unsafe {
                 let _: () = msg_send![overlay.window, orderOut: None::<&NSObject>];
@@ -297,14 +301,21 @@ impl ClockManager {
         };
 
         for overlay in self.overlays.values() {
-            set_label_text(overlay.time_label, &time_str);
-            if let Some(label) = overlay.date_label {
-                set_label_text(label, &date_str);
+            if self.last_text.as_ref().map(|t| &t.0) != Some(&time_str) {
+                set_label_text(overlay.time_label, &time_str);
             }
-            if let (Some(label), Some(text)) = (overlay.secondary_label, &secondary_str) {
-                set_label_text(label, text);
+            if self.last_text.as_ref().map(|t| &t.1) != Some(&date_str) {
+                if let Some(label) = overlay.date_label {
+                    set_label_text(label, &date_str);
+                }
+            }
+            if self.last_text.as_ref().map(|t| &t.2) != Some(&secondary_str) {
+                if let (Some(label), Some(text)) = (overlay.secondary_label, &secondary_str) {
+                    set_label_text(label, text);
+                }
             }
         }
+        self.last_text = Some((time_str, date_str, secondary_str));
     }
 }
 

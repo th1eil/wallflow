@@ -70,6 +70,11 @@ pub enum AppEvent {
     DirectoryScanned {
         dir_path: std::path::PathBuf,
         wallpapers: Vec<std::path::PathBuf>,
+        /// 扫描完成后要直接应用的那张图（下载随机壁纸后切到刚保存的文件）。
+        /// 只有「刷新列表」是必须的，选中哪张是可选语义 —— 为 None 时按
+        /// library 当前模式正常取下一张；为 Some 时用它同步 library 的
+        /// current_index/history，避免屏幕内容与选中状态错位。
+        select: Option<std::path::PathBuf>,
     },
     /// Apply a named filter preset to the active screen
     SetFilterPreset(crate::color::FilterPreset),
@@ -124,11 +129,14 @@ pub enum AppEvent {
     /// 时钟据此判断是否需要把字体颜色替换为对比色（规则见 contrast.rs）。
     /// 静态图片、GIF/APNG 首帧、视频首帧都汇总到这一个事件。
     WallpaperLuma {
+        /// 静态/首帧采样带请求代数；视频由播放器自行管理生命周期。
+        sequence_id: Option<u64>,
         screen_number: u32,
         luma: f64,
     },
     WallpaperProcessed {
         sequence_id: u64,
+        luma: f64,
         original_path: std::path::PathBuf,
         filtered_path: std::path::PathBuf,
         screen_number: u32,

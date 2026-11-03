@@ -19,6 +19,7 @@ mod lunar;
 mod notch;
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -350,7 +351,13 @@ impl AppState {
                     manager.show_status(text.as_deref());
                 }
             }
-            AppEvent::WallpaperLuma { screen_number, luma } => {
+            AppEvent::WallpaperLuma { sequence_id, screen_number, luma } => {
+                if let Some(id) = sequence_id {
+                    if self.screens.get(&screen_number)
+                        .map(|s| s.render_generation.load(Ordering::Relaxed)) != Some(id) {
+                        return;
+                    }
+                }
                 // 采样（解码 + 采样）已经在后台线程做完，这里只做颜色决策与贴色：
                 // 「换壁纸 → 自动改对比色」的全部主线程成本就是三次 setTextColor。
                 self.clock_manager.set_background_luma(screen_number, luma);
@@ -462,6 +469,8 @@ impl AppState {
                             util::send_event(&tx, AppEvent::DirectoryScanned {
                                 dir_path: dir,
                                 wallpapers,
+                                // 换目录后沿用原有语义：由 library 决定先显示哪张
+                                select: None,
                             });
                         });
                     }
@@ -526,7 +535,7 @@ impl AppState {
                     // Persistent "in flight" hint; replaced by the outcome below
                     util::send_event(&tx, AppEvent::SetStatusLine(Some("正在获取随机壁纸…".to_string())));
                     tokio::spawn(async move {
-                        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(PathBuf, Vec<PathBuf>, String)> {
+                        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(PathBuf, Vec<PathBuf>, PathBuf, String)> {
                                 let path = wallpaper::download_random_wallpaper(&dl_dir, &url)?;
                                 let display_name = path.file_name()
                                     .and_then(|f| f.to_str())
@@ -534,17 +543,25 @@ impl AppState {
                                     .to_string();
                                 println!("Downloaded: {:?}", path);
                                 let wallpapers = library::collect_wallpapers(&dl_dir);
-                                Ok((dl_dir, wallpapers, display_name))
+                                // 下载结果原样带回主线程：后台只负责下载与扫描，
+                                // 「应用到哪块屏、要不要切」留给事件处理决定。
+                                Ok((dl_dir, wallpapers, path, display_name))
                             }).await;
 
                         match res {
-                            Ok(Ok((dir_path, wallpapers, name))) => {
+                            Ok(Ok((dir_path, wallpapers, path, name))) => {
+                                // 「刷新列表 + 切到刚下载的这张」必须在同一个事件里完成。
+                                // 拆成 DirectoryScanned + SetWallpaper 两步会先按模式随机/
+                                // 顺序应用另一张，再淡入一次：白跑一轮整图渲染，用户还会
+                                // 看到壁纸闪两下。select 让 DirectoryScanned 直接把
+                                // library 的选中项对齐到这张，后续 Next/滤镜预览也在同一张上。
                                 util::send_event(&tx, AppEvent::DirectoryScanned {
                                     dir_path,
                                     wallpapers,
+                                    select: Some(path),
                                 });
-                                util::flash_status(&tx, format!("已保存 {}", name), 5);
-                                notification::post("随机壁纸已保存", &name);
+                                util::flash_status(&tx, format!("已切换为 {}", name), 5);
+                                notification::post("随机壁纸已应用", &name);
                             }
                             Ok(Err(e)) => {
                                 eprintln!("Failed to download wallpaper: {:?}", e);
@@ -562,8 +579,11 @@ impl AppState {
                     util::flash_status(&self.event_tx, "尚未配置壁纸目录".to_string(), 4);
                 }
             }
-            AppEvent::WallpaperProcessed { sequence_id, original_path, filtered_path, screen_number, ref info } => {
-                if sequence_id == self.loading_sequence {
+            AppEvent::WallpaperProcessed { sequence_id, luma, original_path, filtered_path, screen_number, ref info } => {
+                if self.screens.get(&screen_number)
+                    .map(|s| s.render_generation.load(Ordering::Relaxed)) == Some(sequence_id) {
+                    // 亮度与有效壁纸一起提交，过期任务不能覆盖新壁纸的文字颜色。
+                    self.clock_manager.set_background_luma(screen_number, luma);
                     println!("Setting wallpaper on screen {} to: {:?}", screen_number, filtered_path);
 
                     // Find the target screen and set wallpaper only on it
@@ -597,13 +617,22 @@ impl AppState {
                     let _ = std::fs::remove_file(filtered_path);
                 }
             }
-            AppEvent::DirectoryScanned { dir_path, wallpapers } => {
+            AppEvent::DirectoryScanned { dir_path, wallpapers, select } => {
                 println!("Scanned {} wallpapers from {:?}", wallpapers.len(), dir_path);
                 self.library.dir_path = Some(dir_path);
                 self.library.wallpapers = wallpapers;
                 self.library.current_index = None;
                 self.library.history_idx = None;
-                if let Some(path) = self.library.next() {
+
+                // 指定了要应用的那张（下载随机壁纸后）就把它同步成 library 的
+                // 当前选中项；不在扫描结果里时（下载后被移走、删除）走 select_path
+                // 的 false，退回原有 next()，仍然显示一张壁纸而不是留空。
+                let selected = select.filter(|p| self.library.select_path(p.as_path()));
+                let path = match selected {
+                    Some(path) => Some(path),
+                    None => self.library.next(),
+                };
+                if let Some(path) = path {
                     let sn = self.active_screen_number;
                     self.apply_wallpaper_on_screen(sn, &path);
                 }
@@ -613,6 +642,13 @@ impl AppState {
 
     /// Apply a wallpaper to a specific screen, identified by its NSScreenNumber.
     fn apply_wallpaper_on_screen(&mut self, screen_number: u32, path: &std::path::Path) {
+        // 所有切换（含原图/视频）都使旧静态处理失效，否则旧滤镜结果会盖回新图。
+        self.loading_sequence += 1;
+        let sequence_id = self.loading_sequence;
+        let Some(state) = self.screens.get(&screen_number) else { return; };
+        let generation = state.render_generation.clone();
+        generation.store(sequence_id, Ordering::Relaxed);
+
         // Stop any active player on this screen before switching
         if let Some(screen_state) = self.screens.get_mut(&screen_number) {
             screen_state.dynamic_player.stop();
@@ -648,6 +684,9 @@ impl AppState {
                 screen_number,
                 self.clock_manager.sample_band(screen_number),
                 self.event_tx.clone(),
+                generation.clone(),
+                sequence_id,
+                self.clock_manager.wants_luma(),
             );
             self.sync_menu_state();
             return;
@@ -675,6 +714,9 @@ impl AppState {
                 screen_number,
                 self.clock_manager.sample_band(screen_number),
                 self.event_tx.clone(),
+                generation.clone(),
+                sequence_id,
+                self.clock_manager.wants_luma(),
             );
             self.sync_menu_state();
             return;
@@ -753,6 +795,9 @@ impl AppState {
                     screen_number,
                     self.clock_manager.sample_band(screen_number),
                     self.event_tx.clone(),
+                    generation.clone(),
+                    sequence_id,
+                    self.clock_manager.wants_luma(),
                 );
             }
             self.sync_menu_state();
@@ -760,8 +805,6 @@ impl AppState {
         }
 
         // Static wallpaper with filters: process with GPU/CPU filter for the target screen
-        self.loading_sequence += 1;
-        let sequence_id = self.loading_sequence;
         let original_path = path.to_path_buf();
         let filter_pipeline = self.filter_pipeline.clone();
         let event_tx = self.event_tx.clone();
@@ -786,67 +829,80 @@ impl AppState {
         // 闭包里拿不到 self，圆角先取出来
         let notch_radius = self.notch.corner_radius;
         tokio::spawn(async move {
-            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(PathBuf, WallpaperInfo, f64)> {
-                // Use wallpaper::decode_image which falls back to macOS NSImage for HEIC/HEIF
-                let rgba = wallpaper::decode_image(&original_path_for_thread)?;
-                let info = WallpaperInfo::from_image(&original_path_for_thread, &rgba);
-                // 透明判定放在缩放之前：重采样会把边缘 alpha 抹开，可能把「本来
-                // 全不透明」的图误判成需要 PNG，反而丢回慢路径。
-                let keep_alpha = wallpaper::source_may_have_alpha(&original_path_for_thread)
-                    && wallpaper::has_transparent_pixels(&rgba);
-                // 尺寸归一：
-                // - 有刘海：必须 cover 到**精确**的屏幕像素尺寸。系统按 Cover 缩放
-                //   居中裁切，只有尺寸一致，画的 76px 黑条才会 1:1 落在刘海高度上。
-                // - 无刘海：沿用「只缩不放」的 fit，避免放大损失清晰度。
-                let fitted = if notch_geom.is_some() {
-                    notch::cover_to(rgba, target_px.0, target_px.1)
-                } else {
-                    wallpaper::fit_for_screen(rgba, target_px)
-                };
-                // 亮度采样放在画黑条之前：顶部黑条是装饰，不该参与「自动对比色」判定
-                let (bx0, by0, bx1, by1) = band_for_thread;
-                let luma = contrast::sample_region_luma(
-                    &fitted, bx0, by0, bx1, by1, contrast::SAMPLE_STEP,
-                );
-                let mut out_img = if filters.is_default() {
-                    fitted
-                } else {
-                    filter_pipeline.process_image(&fitted, &filters)?
-                };
-                // 黑条必须最后画：先画会被滤镜一起调亮/染色，得到的不是纯黑
-                if let Some(geom) = notch_geom {
-                    notch::draw_top_bar(
-                        &mut out_img,
-                        geom.height_px(),
-                        geom.radius_px(notch_radius),
+            let permit = util::image_work_permit().await;
+            // 排队期间被替换的请求不再解码；已经开始的任务在阶段边界及时退出。
+            if generation.load(Ordering::Relaxed) != sequence_id { return; }
+            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(PathBuf, WallpaperInfo, f64)>> {
+                let _permit = permit;
+                let is_current = || generation.load(Ordering::Relaxed) == sequence_id;
+                if !is_current() { return Ok(None); }
+                // NSImage 回退会产生 autoreleased 对象，阻塞线程没有系统事件循环替它释放。
+                objc2::rc::autoreleasepool(|_| {
+                    // Use wallpaper::decode_image which falls back to macOS NSImage for HEIC/HEIF
+                    let rgba = wallpaper::decode_image(&original_path_for_thread)?;
+                    if !is_current() { return Ok(None); }
+                    let info = WallpaperInfo::from_image(&original_path_for_thread, &rgba);
+                    // 透明判定放在缩放之前：重采样会把边缘 alpha 抹开，可能把「本来
+                    // 全不透明」的图误判成需要 PNG，反而丢回慢路径。
+                    let keep_alpha = wallpaper::source_may_have_alpha(&original_path_for_thread)
+                        && wallpaper::has_transparent_pixels(&rgba);
+                    // 尺寸归一：
+                    // - 有刘海：必须 cover 到**精确**的屏幕像素尺寸。系统按 Cover 缩放
+                    //   居中裁切，只有尺寸一致，画的 76px 黑条才会 1:1 落在刘海高度上。
+                    // - 无刘海：沿用「只缩不放」的 fit，避免放大损失清晰度。
+                    let fitted = if notch_geom.is_some() {
+                        notch::cover_to(rgba, target_px.0, target_px.1)
+                    } else {
+                        wallpaper::fit_for_screen(rgba, target_px)
+                    };
+                    if !is_current() { return Ok(None); }
+                    // 亮度采样放在画黑条之前：顶部黑条是装饰，不该参与「自动对比色」判定
+                    let (bx0, by0, bx1, by1) = band_for_thread;
+                    let luma = contrast::sample_region_luma(
+                        &fitted, bx0, by0, bx1, by1, contrast::SAMPLE_STEP,
                     );
-                }
-                // 落 Application Support 而不是 $TMPDIR —— 系统壁纸状态保存的是
-                // 文件 URL，放临时目录会让退出后的桌面指向已删除文件。
-                let stem = format!(
-                    "wallflow_filtered_{}_{}",
-                    std::process::id(),
-                    static_counter
-                );
-                let filtered_path = wallpaper::write_wallpaper_output(&out_img, &stem, keep_alpha)?;
-                // Wrap in guard so cancellation drops the file; keep() prevents deletion on success
-                let guard = TempFileGuard::new(filtered_path);
-                Ok((guard.keep(), info, luma))
+                    let mut out_img = if filters.is_default() {
+                        fitted
+                    } else {
+                        filter_pipeline.process_image(&fitted, &filters)?
+                    };
+                    if !is_current() { return Ok(None); }
+                    // 黑条必须最后画：先画会被滤镜一起调亮/染色，得到的不是纯黑
+                    if let Some(geom) = notch_geom {
+                        notch::draw_top_bar(
+                            &mut out_img,
+                            geom.height_px(),
+                            geom.radius_px(notch_radius),
+                        );
+                    }
+                    // 落 Application Support 而不是 $TMPDIR —— 系统壁纸状态保存的是
+                    // 文件 URL，放临时目录会让退出后的桌面指向已删除文件。
+                    let stem = format!(
+                        "wallflow_filtered_{}_{}_{}",
+                        std::process::id(),
+                        screen_number,
+                        static_counter
+                    );
+                    let filtered_path = wallpaper::write_wallpaper_output(&out_img, &stem, keep_alpha)?;
+                    // Wrap in guard so cancellation drops the file; keep() prevents deletion on success
+                    let guard = TempFileGuard::new(filtered_path);
+                    if !is_current() { return Ok(None); }
+                    Ok(Some((guard.keep(), info, luma)))
+                })
             }).await;
 
             match res {
-                Ok(Ok((filtered_path, info, luma))) => {
-                    // 先发亮度再发壁纸：主线程先按新亮度定好文字色，壁纸淡入完成时
-                    // 颜色已经就位，不会出现「先看清一下再变灰」的闪变。
-                    util::send_event(&event_tx, AppEvent::WallpaperLuma { screen_number, luma });
+                Ok(Ok(Some((filtered_path, info, luma)))) => {
                     util::send_event(&event_tx, AppEvent::WallpaperProcessed {
                         sequence_id,
+                        luma,
                         original_path,
                         filtered_path,
                         screen_number,
                         info,
                     });
                 }
+                Ok(Ok(None)) => {} // 已被更新的请求取代，无需提示错误。
                 Ok(Err(e)) => {
                     eprintln!("Background wallpaper processing error: {:?}", e);
                     util::send_event(&event_tx, AppEvent::SetStatusLine(Some("壁纸处理失败".to_string())));
@@ -895,6 +951,7 @@ impl AppState {
             .collect();
         for num in stale {
             if let Some(ss) = self.screens.remove(&num) {
+                ss.render_generation.fetch_add(1, Ordering::Relaxed);
                 ss.dynamic_player.stop();
                 ss.video_player.stop();
                 if let Some(p) = ss.last_static_path {
@@ -967,12 +1024,24 @@ fn spawn_luma_sampling(
     screen_number: u32,
     band: (f64, f64, f64, f64),
     event_tx: Sender<AppEvent>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    sequence_id: u64,
+    wants_luma: bool,
 ) {
+    // GIF/APNG 也遵守时钟开关，隐藏时钟时不再为首帧额外解码整图。
+    if !wants_luma { return; }
     tokio::spawn(async move {
+        let permit = util::image_work_permit().await;
+        if generation.load(Ordering::Relaxed) != sequence_id { return; }
         let luma = tokio::task::spawn_blocking(move || -> Option<f64> {
-            let img = wallpaper::decode_image(&path).ok()?;
-            let (x0, y0, x1, y1) = band;
-            Some(contrast::sample_region_luma(&img, x0, y0, x1, y1, contrast::SAMPLE_STEP))
+            let _permit = permit;
+            objc2::rc::autoreleasepool(|_| {
+                if generation.load(Ordering::Relaxed) != sequence_id { return None; }
+                let img = wallpaper::decode_image(&path).ok()?;
+                if generation.load(Ordering::Relaxed) != sequence_id { return None; }
+                let (x0, y0, x1, y1) = band;
+                Some(contrast::sample_region_luma(&img, x0, y0, x1, y1, contrast::SAMPLE_STEP))
+            })
         })
         .await
         .unwrap_or(None);
@@ -981,7 +1050,7 @@ fn spawn_luma_sampling(
         // 不因为一次失败把颜色改掉。注意 GIF/APNG 走 image::open 的默认语义，
         // 取到的就是第一帧。
         if let Some(luma) = luma {
-            util::send_event(&event_tx, AppEvent::WallpaperLuma { screen_number, luma });
+            util::send_event(&event_tx, AppEvent::WallpaperLuma { sequence_id: Some(sequence_id), screen_number, luma });
         }
     });
 }
@@ -1184,6 +1253,8 @@ fn main() {
                 util::send_event(&event_tx_clone, AppEvent::DirectoryScanned {
                     dir_path: dir,
                     wallpapers,
+                    // 启动扫描：按 library 模式决定显示哪张
+                    select: None,
                 });
             });
         }

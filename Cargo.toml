@@ -50,7 +50,8 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSLayoutConstraint",
     "NSLayoutAnchor"
 ] }
-objc2-av-foundation = { version = "0.3.2" }
+# 原生 CMTime 视频接口在 AVFoundation 绑定中需要显式启用 CoreMedia。
+objc2-av-foundation = { version = "0.3.2", features = ["objc2-core-media"] }
 # CoreVideo and CoreMedia
 objc2-core-video = { version = "0.3.2" }
 objc2-core-media = { version = "0.3.2" }

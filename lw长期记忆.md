@@ -35,5 +35,26 @@
 - 代价：有刘海且开启时，每次换壁纸都要「解码 + cover + 编码」（54MP 源图约 1.2s，后台线程）。这是图像方案的固有成本；关掉开关即可回到零滤镜直设原图的快路径。
 - **设置面板的分类是强绑定的固定数组**：`SectionColumn::section()` 每调用一次就**新建一张卡片**，而 `settings_ui::navigation_sidebar()` 的 `[Retained<NSButton>; N]` 与 `SettingsNavPtrs { cards: [_; N] }` 写死数量，`try_into().expect(...)` 会在启动时直接 panic。加分类必须同步改：`settings_ui.rs` 的返回类型 + `std::array::from_fn` 长度 + title/symbol 数组、`settings.rs` 的 `SettingsNavPtrs` 三个数组与 `card_views` 长度。
 
+## 随机壁纸下载后自动应用（2026-10-28）
+- `AppEvent::DirectoryScanned` 带 `select: Option<PathBuf>`：表示「扫描完成后要直接显示的那张」。`None` 时按 library 模式取下一张，`Some` 时由 `WallpaperLibrary::select_path` 把它同步成当前选中项。
+- **不要拆成 DirectoryScanned + SetWallpaper 两步**：`DirectoryScanned` 本身就会 `library.next()` 应用一张，再补一个 `SetWallpaper` 等于连续切换两次 —— 有滤镜/刘海时多跑一轮秒级整图渲染，观感是壁纸闪两下。
+- **切图必须同时对齐 `library.current_index` 与 history**：只把屏幕切过去、索引留在旧图，后续 `Next`、滤镜预览、`ConfigReloaded` 重放都会回到另一张，屏幕内容与「当前项」从此错位。
+- `select_path` 返回 `bool`（文件不在扫描结果里 → false），调用方据此退回 `next()`，避免留空。
+- **确认二进制是否含新文案，别用 `strings` / `grep -a`**：实测 `grep -a -c "已切换为" binary` 返回 0（同一条命令里 ASCII 串能命中），而 Python 按字节 `count` 得到 1。中文 UTF-8 在二进制里连续存放，用 `python3 -c "d=open(p,'rb').read(); print(d.count('已切换为'.encode()))"` 复核才可靠。
 
 
+
+
+## 性能与资源生命周期（2026-11-03）
+- GPU 使用 `OnceLock<Option<GpuPipeline>>` 延迟初始化；失败结果同样缓存，原图及仅刘海合成不创建 Metal 管线。
+- 静态处理与首帧亮度采样统一等待 `util::image_work_permit`，permit 必须移入阻塞闭包，保证像素缓冲存活期间只有一个大图任务；代价是多屏同时切图按序处理。
+- `loading_sequence` 只分配全局唯一请求号，是否过期按各屏 `render_generation` 判定；原图/动态切换与拔屏也须使旧任务失效。滤镜输出文件名必须带屏幕号，单纯每屏 counter 会重名。
+- 原生视频 worker 必须逐帧使用 autoreleasepool；AVAssetImageGenerator 跨线程需强引用，copyCGImage 返回值需自动释放。直接 CGImage → NSBitmapImageRep，避免整帧 TIFF 往返；CMTime 必须按值传，不能传 NSValue 指针。
+- 时钟缓存上一组文字，重建时清空；只对变化的标签 setStringValue，减少 AppKit 重绘。当前仍保留 1s 主循环兜底计时器。
+- 本轮仅静态解析/差异检查，未获构建运行授权；不能把预期节省写成实测值。GIF/APNG 仍全帧常驻，视频仍逐帧 PNG 写盘和系统壁纸切换。
+
+## 测试与打包补充（2026-11-03）
+- AVFoundation 0.3.2 默认功能不含 objc2-core-media；使用 duration / copyCGImageAtTime 原生绑定须在 Cargo.toml 显式开启该功能。
+- NSData.bytes 的消息返回类型必须写 *const c_void，再 cast::<u8>()；直接写 *const u8 会在 objc2 调试校验时报 ^v 与 * 不匹配。
+- tests/fixtures/video.mp4 是本地合成的 1 秒红色视频；视频回归验证强引用跨自动释放池存活，以及两帧的解码尺寸、颜色，不会切换桌面。
+- 最终全套测试 43 通过 / 1 ignored，发布 App/DMG 已打包签名并校验。网络下载和系统视频解码在受限环境可能失败，完整验证须允许访问相应网络/系统服务。

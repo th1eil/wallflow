@@ -69,6 +69,8 @@ pub struct ScreenState {
     pub video_player: VideoWallpaperPlayer,
     pub last_static_path: Option<PathBuf>,
     pub static_counter: u64,
+    /// 每屏独立代数：新请求使旧任务失效，其他屏幕的请求不互相取消。
+    pub render_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// What's on screen now (Static/Dynamic/Video), so the UI can react.
     pub content_kind: ContentKind,
     /// Main-thread mirror of the players' pause state. Both player tasks treat
@@ -93,6 +95,7 @@ impl ScreenState {
             video_player: VideoWallpaperPlayer::new(event_tx),
             last_static_path: None,
             static_counter: 0,
+            render_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             content_kind: ContentKind::None,
             paused: false,
             loop_mode: LoopMode::Infinite,

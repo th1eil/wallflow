@@ -181,7 +181,8 @@ pub fn preset_tag_for_params(params: &FilterParams) -> Option<&'static str> {
 }
 
 pub struct FilterPipeline {
-    gpu: Option<GpuPipeline>,
+    // 原图和刘海合成不使用滤镜，首次真正处理滤镜时再创建 Metal 资源。
+    gpu: std::sync::OnceLock<Option<GpuPipeline>>,
 }
 
 struct GpuPipeline {
@@ -195,16 +196,18 @@ struct GpuPipeline {
 
 impl FilterPipeline {
     pub fn new() -> Self {
-        match Self::init_gpu() {
-            Ok(gpu) => {
-                println!("wgpu GPU Filter initialized successfully.");
-                Self { gpu: Some(gpu) }
-            }
+        Self { gpu: std::sync::OnceLock::new() }
+    }
+
+    /// 初始化失败也缓存，避免没有可用 GPU 时每次切图重复探测驱动。
+    fn gpu(&self) -> Option<&GpuPipeline> {
+        self.gpu.get_or_init(|| match Self::init_gpu() {
+            Ok(gpu) => Some(gpu),
             Err(e) => {
-                eprintln!("Failed to initialize wgpu GPU pipeline: {:?}. Falling back to CPU filtering.", e);
-                Self { gpu: None }
+                eprintln!("GPU initialization failed: {:?}; using CPU filters", e);
+                None
             }
-        }
+        }).as_ref()
     }
 
     fn init_gpu() -> Result<GpuPipeline> {
@@ -356,7 +359,7 @@ impl FilterPipeline {
 
     /// Process the image. Uses GPU if initialized, otherwise falls back to CPU.
     pub fn process_image(&self, img: &image::RgbaImage, params: &FilterParams) -> Result<image::RgbaImage> {
-        if let Some(ref gpu) = self.gpu {
+        if let Some(gpu) = self.gpu() {
             let (w, h) = img.dimensions();
             if !Self::fits_device(gpu, w, h) {
                 eprintln!(
@@ -864,7 +867,7 @@ mod tests {
     #[test]
     fn cpu_filter_keeps_dimensions() {
         let img = image::RgbaImage::from_pixel(8, 4, image::Rgba([120, 130, 140, 255]));
-        let pipeline = FilterPipeline { gpu: None };
+        let pipeline = FilterPipeline { gpu: std::sync::OnceLock::from(None) };
         let out = pipeline.process_image_cpu(
             &img,
             &FilterParams {

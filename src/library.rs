@@ -85,6 +85,21 @@ impl WallpaperLibrary {
         self.mode = mode;
     }
 
+    /// 把指定文件设为当前选中项（同步 `current_index` 与历史指针）。
+    ///
+    /// 用于「下载随机壁纸后立刻显示刚保存的那张」：只把屏幕切过去而不改
+    /// `current_index`，下一次 Next 或滤镜预览会从旧索引继续，屏幕内容与
+    /// 「当前项」从此错位。返回 false 表示该文件不在列表里（被移走/删除），
+    /// 调用方应退回 `next()` 而不是留空。
+    pub fn select_path(&mut self, path: &Path) -> bool {
+        let Some(idx) = self.wallpapers.iter().position(|w| w == path) else {
+            return false;
+        };
+        self.current_index = Some(idx);
+        self.add_to_history(path.to_path_buf());
+        true
+    }
+
     /// Add wallpaper to history (max 50 items)
     pub fn add_to_history(&mut self, path: PathBuf) {
         // Avoid consecutive duplicate entries
@@ -212,4 +227,54 @@ pub fn collect_wallpapers(dir: &Path) -> Vec<PathBuf> {
     }
     wallpapers.sort();
     wallpapers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // 显式引入：父模块的 `use` 是私有绑定，不依赖 `super::*` 的间接可见性
+    use std::path::{Path, PathBuf};
+
+    fn lib_with(paths: &[&str]) -> WallpaperLibrary {
+        let mut lib = WallpaperLibrary::new();
+        lib.wallpapers = paths.iter().map(PathBuf::from).collect();
+        lib
+    }
+
+    /// 下载后直接切到指定文件：选中项与历史指针都要对齐，Sequential 的
+    /// 下一次 Next 必须从这张继续，而不是回到第一张。
+    #[test]
+    fn select_path_aligns_current_and_history() {
+        let mut lib = lib_with(&["/w/a.jpg", "/w/b.jpg", "/w/c.jpg"]);
+
+        assert!(lib.select_path(Path::new("/w/c.jpg")));
+        assert_eq!(lib.current_index, Some(2));
+        assert_eq!(lib.history.back(), Some(&PathBuf::from("/w/c.jpg")));
+        assert_eq!(lib.history_idx, Some(0));
+
+        assert_eq!(lib.next(), Some(PathBuf::from("/w/a.jpg")));
+    }
+
+    /// 指定文件不在列表里时必须是 no-op，调用方据此退回 next()，
+    /// 不能让 library 停在「看似选中、实则无效」的索引上。
+    #[test]
+    fn select_path_missing_is_noop() {
+        let mut lib = lib_with(&["/w/a.jpg"]);
+
+        assert!(!lib.select_path(Path::new("/w/missing.jpg")));
+        assert_eq!(lib.current_index, None);
+        assert!(lib.history.is_empty());
+    }
+
+    /// Random 模式下同样要命中指定文件：这是「下载后切到刚保存那张」的
+    /// 核心保证 —— 不能被随机抽签覆盖。
+    #[test]
+    fn select_path_wins_over_random_mode() {
+        let mut lib = lib_with(&["/w/a.jpg", "/w/b.jpg"]);
+        lib.set_mode(SwitchMode::Random);
+
+        assert!(lib.select_path(Path::new("/w/b.jpg")));
+        assert_eq!(lib.current_index, Some(1));
+        assert_eq!(lib.history.len(), 1);
+    }
 }
