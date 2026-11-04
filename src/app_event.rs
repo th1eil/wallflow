@@ -56,6 +56,14 @@ impl WallpaperInfo {
     }
 }
 
+/// 区分取消、仅入库、入库并应用，避免把「不应用」误当作取消保存。
+#[derive(Debug, Clone, Copy)]
+pub enum RandomWallpaperChoice {
+    Cancel,
+    SaveOnly,
+    SaveAndApply,
+}
+
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     Previous,
@@ -118,6 +126,21 @@ pub enum AppEvent {
     SetFps(u32),
     /// Download a random wallpaper from an online source (picsum.photos).
     DownloadRandomWallpaper,
+    /// 临时下载完成后交给主线程展示；目录随最后一个持有者释放而清理。
+    RandomWallpaperReady {
+        temporary_dir: std::sync::Arc<tempfile::TempDir>,
+        path: std::path::PathBuf,
+    },
+    /// 下载或保存失败统一回主线程，确保忙碌状态能复位。
+    RandomWallpaperFailed(String),
+    /// 原生预览窗口只提交一次选择，不在回调中修改应用状态。
+    ConfirmRandomWallpaper(RandomWallpaperChoice),
+    RandomWallpaperSaved {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+        /// 仅保存不能改变当前选择、历史记录或桌面。
+        apply: bool,
+    },
     /// Open the current wallpaper directory in Finder.
     OpenWallpaperFolder,
     /// The set of connected displays changed (hot-plug, resolution change).

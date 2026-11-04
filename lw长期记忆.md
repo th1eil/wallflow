@@ -58,3 +58,16 @@
 - NSData.bytes 的消息返回类型必须写 *const c_void，再 cast::<u8>()；直接写 *const u8 会在 objc2 调试校验时报 ^v 与 * 不匹配。
 - tests/fixtures/video.mp4 是本地合成的 1 秒红色视频；视频回归验证强引用跨自动释放池存活，以及两帧的解码尺寸、颜色，不会切换桌面。
 - 最终全套测试 43 通过 / 1 ignored，发布 App/DMG 已打包签名并校验。网络下载和系统视频解码在受限环境可能失败，完整验证须允许访问相应网络/系统服务。
+
+
+## 随机壁纸确认（2026-11-04）
+- 随机下载先到独立 TempDir；预览仅提供「仅保存」「保存并应用」两个按钮，关闭窗口取消并释放临时目录。Arc 使临时图片活到后台保存结束。
+- AppState::handle_event 执行时持有状态锁和事件接收锁，确认界面使用非模态 NSWindow，回调只发事件；不要在这里引入 runModal 嵌套事件循环导致锁重入。
+- 确认保存用 NamedTempFile + persist_noclobber 防止半文件与覆盖；成功直接插入 library，仅保存不改 current_index/history，保存并应用才 select_path 与切图。不用 DirectoryScanned 重置列表并多切一张。下载/预览/保存共享忙碌标记。
+- RandomWallpaperChoice 用 Cancel/SaveOnly/SaveAndApply 明确区分三条路径；后台保存结果携带 apply，不能将「不应用」混同「不保存」。
+
+
+## 随机壁纸确认运行验证（2026-11-04）
+- 发布编译与完整测试通过：48 passed / 1 ignored；App/签名/DMG 校验通过。原生实际点击验证取消、仅保存、保存并应用，日志见 reports/confirmation-2026-11-04/ui-validation.log。
+- 隔离原生验证涉及 AppState，必须在主线程定时回调检查；它包含 AppKit 对象，不能移入 tokio::spawn。验证副本与正式包分离；共享 target 构建后须恢复正式可执行文件并核对哈希。
+- macOS 壁纸 Store 含嵌套二进制 plist，读取系统应用结果时需递归解析 bytes；不要只找顶层 relative 字段。

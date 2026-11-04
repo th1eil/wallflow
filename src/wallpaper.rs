@@ -336,6 +336,15 @@ pub fn write_wallpaper_output(
 
 static DOWNLOAD_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// 确认后才提交到壁纸库；临时文件与目标同盘，提交不会暴露半写入图片或覆盖同名文件。
+pub fn save_confirmed_random_wallpaper(source: &Path, dir: &Path) -> Result<PathBuf> {
+    let destination = dir.join(source.file_name().ok_or_else(|| anyhow!("壁纸文件名无效"))?);
+    let mut output = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::copy(&mut std::fs::File::open(source)?, &mut output)?;
+    output.persist_noclobber(&destination)?;
+    Ok(destination)
+}
+
 /// Download a random wallpaper from picsum.photos (free, no API key required).
 /// Saves to the given directory and returns the file path.
 /// Uses `curl` with failure status code checking and file validation.
@@ -385,6 +394,33 @@ pub fn download_random_wallpaper(dir: &Path, url: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 确认只保存到目标库，临时来源的生命周期仍由调用方管理。
+    #[test]
+    fn confirmed_wallpaper_is_copied_to_library() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("random.jpg");
+        std::fs::write(&source, b"complete image bytes").unwrap();
+        let saved = save_confirmed_random_wallpaper(&source, library.path()).unwrap();
+        assert_eq!(saved, library.path().join("random.jpg"));
+        assert_eq!(std::fs::read(&saved).unwrap(), std::fs::read(&source).unwrap());
+        assert_eq!(std::fs::read_dir(library.path()).unwrap().count(), 1);
+    }
+
+    /// 同名冲突不可覆盖既有壁纸，也不能遗留半成品供轮播扫描。
+    #[test]
+    fn confirmed_wallpaper_never_overwrites_existing_file() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let library = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("random.jpg");
+        let existing = library.path().join("random.jpg");
+        std::fs::write(&source, b"new image").unwrap();
+        std::fs::write(&existing, b"original image").unwrap();
+        assert!(save_confirmed_random_wallpaper(&source, library.path()).is_err());
+        assert_eq!(std::fs::read(existing).unwrap(), b"original image");
+        assert_eq!(std::fs::read_dir(library.path()).unwrap().count(), 1);
+    }
 
     /// 验证随机壁纸下载链路（curl 下载 → 文件非空 → 有效图片）
     #[test]

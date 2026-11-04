@@ -45,7 +45,7 @@ fn apply_font(label: &NSTextField, size: f64, weight: f64) {
     }
 }
 
-fn make_label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
+pub fn make_label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
     let label = NSTextField::new(mtm);
     unsafe {
         let text_ns = NSString::from_str(text);

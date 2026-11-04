@@ -7,6 +7,7 @@ mod color;
 mod config;
 mod settings;
 mod settings_ui;
+mod random_preview;
 mod screen;
 mod playback;
 mod video;
@@ -33,7 +34,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSNotificationCenter, NSObjectProtocol, NSURL, NSString};
 use library::WallpaperLibrary;
-use app_event::{AppEvent, WallpaperInfo};
+use app_event::{AppEvent, RandomWallpaperChoice, WallpaperInfo};
 use menubar::MenuBarManager;
 
 pub struct AppState {
@@ -48,6 +49,9 @@ pub struct AppState {
     pub event_tx: Sender<AppEvent>,
     /// 随机壁纸下载 URL，用户在设置中可自定义
     pub random_wallpaper_url: String,
+    /// 覆盖下载、预览与提交，避免重复请求叠加窗口和大图内存。
+    random_wallpaper_busy: bool,
+    random_preview: Option<random_preview::RandomPreview>,
     /// Last configuration actually applied — lets repeated ConfigReloaded
     /// events (设置面板 Apply 与 watcher 回声之外的重复) act as no-ops.
     pub last_applied: Option<config::Config>,
@@ -105,6 +109,8 @@ impl AppState {
             loading_sequence: 0,
             event_tx: event_tx.clone(),
             random_wallpaper_url: config::Config::default().random_wallpaper_url,
+            random_wallpaper_busy: false,
+            random_preview: None,
             last_applied: None,
             clock_manager: clock::ClockManager::new(config::ClockConfig::default()),
             notch: config::NotchConfig::default(),
@@ -527,57 +533,104 @@ impl AppState {
                 }
             }
             AppEvent::DownloadRandomWallpaper => {
-                println!("Downloading random wallpaper from {}...", self.random_wallpaper_url);
-                if let Some(ref dir) = self.library.dir_path {
-                    let tx = self.event_tx.clone();
-                    let dl_dir = dir.clone();
-                    let url = self.random_wallpaper_url.clone();
-                    // Persistent "in flight" hint; replaced by the outcome below
-                    util::send_event(&tx, AppEvent::SetStatusLine(Some("正在获取随机壁纸…".to_string())));
-                    tokio::spawn(async move {
-                        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(PathBuf, Vec<PathBuf>, PathBuf, String)> {
-                                let path = wallpaper::download_random_wallpaper(&dl_dir, &url)?;
-                                let display_name = path.file_name()
-                                    .and_then(|f| f.to_str())
-                                    .unwrap_or("壁纸")
-                                    .to_string();
-                                println!("Downloaded: {:?}", path);
-                                let wallpapers = library::collect_wallpapers(&dl_dir);
-                                // 下载结果原样带回主线程：后台只负责下载与扫描，
-                                // 「应用到哪块屏、要不要切」留给事件处理决定。
-                                Ok((dl_dir, wallpapers, path, display_name))
-                            }).await;
-
-                        match res {
-                            Ok(Ok((dir_path, wallpapers, path, name))) => {
-                                // 「刷新列表 + 切到刚下载的这张」必须在同一个事件里完成。
-                                // 拆成 DirectoryScanned + SetWallpaper 两步会先按模式随机/
-                                // 顺序应用另一张，再淡入一次：白跑一轮整图渲染，用户还会
-                                // 看到壁纸闪两下。select 让 DirectoryScanned 直接把
-                                // library 的选中项对齐到这张，后续 Next/滤镜预览也在同一张上。
-                                util::send_event(&tx, AppEvent::DirectoryScanned {
-                                    dir_path,
-                                    wallpapers,
-                                    select: Some(path),
-                                });
-                                util::flash_status(&tx, format!("已切换为 {}", name), 5);
-                                notification::post("随机壁纸已应用", &name);
-                            }
-                            Ok(Err(e)) => {
-                                eprintln!("Failed to download wallpaper: {:?}", e);
-                                util::flash_status(&tx, "随机壁纸下载失败".to_string(), 6);
-                                notification::post("随机壁纸下载失败", &format!("{:#}", e));
-                            }
-                            Err(e) => {
-                                eprintln!("Download wallpaper task joined with error: {:?}", e);
-                                util::flash_status(&tx, "随机壁纸下载失败".to_string(), 6);
-                                notification::post("随机壁纸下载失败", "后台任务异常退出");
-                            }
-                        }
-                    });
-                } else {
-                    util::flash_status(&self.event_tx, "尚未配置壁纸目录".to_string(), 4);
+                if self.random_wallpaper_busy {
+                    if let Some(preview) = &self.random_preview {
+                        preview.show(self.mtm);
+                    }
+                    return;
                 }
+                if self.library.dir_path.is_none() {
+                    util::flash_status(&self.event_tx, "尚未配置壁纸目录".to_string(), 4);
+                    return;
+                }
+                self.random_wallpaper_busy = true;
+                let tx = self.event_tx.clone();
+                let url = self.random_wallpaper_url.clone();
+                util::send_event(&tx, AppEvent::SetStatusLine(Some("正在获取随机壁纸…".into())));
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                        // 临时目录与壁纸库隔离：未经确认的图片不会参与扫描或轮播。
+                        let temporary_dir = Arc::new(tempfile::tempdir()?);
+                        let path = wallpaper::download_random_wallpaper(temporary_dir.path(), &url)?;
+                        Ok((temporary_dir, path))
+                    }).await;
+                    match result {
+                        Ok(Ok((temporary_dir, path))) => util::send_event(&tx,
+                            AppEvent::RandomWallpaperReady { temporary_dir, path }),
+                        Ok(Err(e)) => util::send_event(&tx, AppEvent::RandomWallpaperFailed(format!("{:#}", e))),
+                        Err(e) => util::send_event(&tx, AppEvent::RandomWallpaperFailed(e.to_string())),
+                    }
+                });
+            }
+            AppEvent::RandomWallpaperReady { temporary_dir, path } => {
+                match random_preview::RandomPreview::new(self.mtm, self.event_tx.clone(), temporary_dir, path) {
+                    Ok(preview) => {
+                        preview.show(self.mtm);
+                        self.random_preview = Some(preview);
+                        util::send_event(&self.event_tx, AppEvent::SetStatusLine(Some("请预览并确认随机壁纸".into())));
+                    }
+                    Err(e) => self.handle_event(AppEvent::RandomWallpaperFailed(e.to_string())),
+                }
+            }
+            AppEvent::ConfirmRandomWallpaper(choice) => {
+                let Some(preview) = self.random_preview.take() else { return; };
+                if matches!(choice, RandomWallpaperChoice::Cancel) {
+                    // 丢弃窗口同时释放临时目录，不触碰壁纸库、历史与桌面。
+                    self.random_wallpaper_busy = false;
+                    util::flash_status(&self.event_tx, "已取消保存随机壁纸".into(), 3);
+                    return;
+                }
+                let apply = matches!(choice, RandomWallpaperChoice::SaveAndApply);
+                let Some(dir) = self.library.dir_path.clone() else {
+                    self.handle_event(AppEvent::RandomWallpaperFailed("尚未配置壁纸目录".into()));
+                    return;
+                };
+                let path = preview.path.clone();
+                let temporary_dir = preview.temporary_dir.clone();
+                drop(preview);
+                let tx = self.event_tx.clone();
+                util::send_event(&tx, AppEvent::SetStatusLine(Some("正在保存随机壁纸…".into())));
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                        // 跨文件系统复制后原子提交，失败时不留下可被轮播选中的半张图。
+                        // 强引用让临时来源活到复制结束，即使预览窗口已经关闭。
+                        let _temporary_dir = temporary_dir;
+                        let destination = wallpaper::save_confirmed_random_wallpaper(&path, &dir)?;
+                        Ok((dir, destination))
+                    }).await;
+                    match result {
+                        Ok(Ok((dir, path))) => util::send_event(&tx, AppEvent::RandomWallpaperSaved { dir, path, apply }),
+                        Ok(Err(e)) => util::send_event(&tx, AppEvent::RandomWallpaperFailed(format!("{:#}", e))),
+                        Err(e) => util::send_event(&tx, AppEvent::RandomWallpaperFailed(e.to_string())),
+                    }
+                });
+            }
+            AppEvent::RandomWallpaperSaved { dir, path, apply } => {
+                self.random_wallpaper_busy = false;
+                // 保存期间目录可能已修改：旧目录的结果不能覆盖当前库或触发切图。
+                if self.library.dir_path.as_ref() == Some(&dir) {
+                    if !self.library.wallpapers.contains(&path) {
+                        self.library.wallpapers.push(path.clone());
+                    }
+                    if apply {
+                        self.library.select_path(&path);
+                        self.apply_wallpaper_on_screen(self.active_screen_number, &path);
+                        util::flash_status(&self.event_tx, "随机壁纸已保存，正在应用".into(), 5);
+                    } else {
+                        // 仅入库保留当前索引与历史，不触发任何桌面处理或切图。
+                        self.sync_menu_state();
+                        util::flash_status(&self.event_tx, "随机壁纸已保存到壁纸库".into(), 5);
+                    }
+                } else {
+                    util::flash_status(&self.event_tx, "随机壁纸已保存到原目录".into(), 5);
+                }
+            }
+            AppEvent::RandomWallpaperFailed(error) => {
+                self.random_wallpaper_busy = false;
+                self.random_preview = None;
+                eprintln!("Random wallpaper failed: {}", error);
+                util::flash_status(&self.event_tx, "随机壁纸获取或保存失败".into(), 6);
+                notification::post("随机壁纸操作失败", &error);
             }
             AppEvent::WallpaperProcessed { sequence_id, luma, original_path, filtered_path, screen_number, ref info } => {
                 if self.screens.get(&screen_number)
